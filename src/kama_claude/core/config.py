@@ -18,15 +18,15 @@ _DEFAULT_CONFIG_PATH = "~/.kama/config.toml"
 
 @dataclass
 class LoggingConfig:
-    level: str = _DEFAULT_LOG_LEVEL
+    level: str = _DEFAULT_LOG_LEVEL 
     file: str = _DEFAULT_LOG_FILE
     format: str = _DEFAULT_LOG_FORMAT  # "text" | "json"
 
 
 @dataclass
 class KamaConfig:
-    host: str = _DEFAULT_HOST
-    port: int = _DEFAULT_PORT
+    host: str = _DEFAULT_HOST # 主机地址
+    port: int = _DEFAULT_PORT # 端口号
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
