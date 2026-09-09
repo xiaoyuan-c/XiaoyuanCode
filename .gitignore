@@ -16,3 +16,6 @@ uv.lock
 .DS_Store
 *.log
 workspace/
+
+# 个人项目学习目录
+a_Learning/ 
