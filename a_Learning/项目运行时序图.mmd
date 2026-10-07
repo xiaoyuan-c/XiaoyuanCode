@@ -1,0 +1,93 @@
+%% 以 kama-tui 的 chat session 为例；普通内建工具的执行链路。
+%% agent.run 为一次性入口：后台创建 one_shot session run，立即返回 run_id。
+%% session.send_message handler 等待 run 完成；独立命令任务允许同时接收 permission.respond。
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant T as kama-tui / SocketClient
+    participant C as SocketServer / CoreApp
+    participant S as SessionManager / SessionStore
+    participant R as AgentRunner / ExecutionContext
+    participant A as AgentLoop
+    participant L as LLMProvider
+    participant I as invoke_tool / ToolRegistry
+    participant P as PermissionManager
+    participant X as 内建工具
+    participant E as EventBus
+    participant B as IpcEventBroadcaster
+    participant W as EventWriter / TraceWriter
+
+    T->>C: event.subscribe(topics, scope)
+    C->>B: 注册事件订阅
+    C-->>T: subscription_id
+    T->>C: session.create(mode=chat)
+    C->>S: create() + write_meta()
+    C-->>T: session_id
+    U->>T: 输入目标或 /skill 指令
+    T->>C: session.send_message(session_id, content)
+    C->>S: send_message()
+    Note over C: 每条命令独立 create_task，读循环保持接收请求
+    S->>S: 会话互斥锁 + 写用户消息 / 元数据
+    opt /skill 指令
+        S->>S: SkillLoader 解析提示与工具白名单
+    end
+    S->>R: runner_factory().run_and_capture()
+    R->>S: 读取 thread / notes
+    R->>R: 加载 global / project context，组装工具与 EventWriter
+    R->>A: run(context)
+
+    loop 直到 end_turn、最大步数或失败
+        A->>L: chat(messages, system, tool_schemas)
+        L-->>E: llm.token / llm.usage 等事件
+        E-->>B: 匹配 topic / run scope
+        B-->>T: event.push 实时更新
+        E-->>W: 记录事件与 trace
+        L-->>A: text / thinking / tool_calls / stop_reason
+        A->>R: 追加 assistant content blocks
+        opt stop_reason = tool_use
+            loop 本轮每个工具调用（顺序执行）
+                A->>I: invoke_tool(tool_call)
+                I->>I: 查找工具 + Pydantic 参数校验（若 params_model 存在）
+                I->>P: check_and_wait()
+                alt 需要用户审批
+                    P->>E: permission.requested
+                    E-->>B: 推送权限请求
+                    B-->>T: 展示审批卡片
+                    U->>T: 允许一次 / 始终允许 / 拒绝
+                    T->>C: permission.respond(tool_use_id, decision)
+                    C->>P: respond()，resolve 挂起的 Future
+                    C-->>T: 审批命令响应
+                else 策略 / 缓存已有决策
+                    P->>P: 自动允许或拒绝
+                end
+                P-->>I: allowed / decision
+                alt 放行
+                    I->>X: 限时 invoke(params)，可重试错误按规则退避
+                    X-->>I: ToolResult
+                else 拒绝或审批超时
+                    I->>I: 构造 permission_denied ToolResult
+                end
+                I-->>E: tool.call_finished / tool.call_failed
+                I-->>A: ToolResult
+                A->>R: 追加 tool_result，作为下一轮输入
+            end
+            opt 已启用自动压缩且上下文水位达到阈值
+                A->>L: Compactor 请求摘要（不带工具）
+                L-->>A: 摘要替换当前 messages
+            end
+        end
+    end
+
+    A-->>R: 执行结束 / context.result
+    R->>E: run.finished
+    E-->>B: 推送完成事件
+    B-->>T: 更新状态
+    R->>S: 追加本次 run 消息到 thread.jsonl
+    R-->>S: RunOutcome
+    S->>S: chat → waiting_for_input；更新 meta.json
+    S->>E: session.waiting_for_input
+    E-->>B: 推送可继续输入事件
+    B-->>T: 恢复输入框
+    S-->>C: run_id
+    C-->>T: session.send_message 响应
+    Note over U,T: 后续输入复用同一 session，再创建一次 run

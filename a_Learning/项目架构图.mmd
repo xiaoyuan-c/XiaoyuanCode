@@ -1,0 +1,115 @@
+%% KamaClaude / XiaoyuanCode 当前源码架构，整理于 2026-10-07。
+%% 实线：调用或数据读写；虚线：事件发布、推送或观测。
+%% 子 Agent 运行在 kama-core 的 asyncio 中，不是独立 daemon。
+%% SocketServer 实际使用 TCP，默认 127.0.0.1:7437。
+flowchart TB
+    subgraph CLIENT["客户端进程 · 交互层"]
+        TUI["kama-tui / Textual<br/>聊天 · 工具进度 · 权限审批 · /compact"]
+        CLI["kama CLI<br/>脚本调用 · 调试 · trace 查看"]
+        SC["SocketClient<br/>请求 ID 匹配 · 响应与事件分流"]
+        TUI --> SC
+        CLI --> SC
+    end
+
+    subgraph CORE["kama-core 常驻进程 · Python / asyncio"]
+        RPC["SocketServer + CoreApp<br/>JSON-RPC 2.0 / NDJSON / TCP<br/>默认 127.0.0.1:7437 · Pydantic 协议模型"]
+        SM["SessionManager<br/>会话状态 · 每会话互斥锁 · 消息分发"]
+        SK["SkillLoader<br/>/skill 指令 · 系统提示 · 工具白名单"]
+        RUN["AgentRunner<br/>组装一次 run 的依赖 · 加载历史与记忆 · 保存结果"]
+        CTX["ExecutionContext<br/>messages · system prompt · 步数 · 终止状态"]
+        LOOP["AgentLoop / ReAct<br/>模型决策 → 工具执行 → 结果回填 → 下一轮"]
+        LLM["LLMProvider → AnthropicProvider<br/>流式响应 · tool_use · usage · prompt caching"]
+        COMP["Compactor + budget<br/>上下文水位 · 工具结果截断 · 手动/可选自动摘要"]
+        INV["invoke_tool + ToolRegistry<br/>工具查找 · 参数校验 · 超时 · 错误分类与重试"]
+        PM["PermissionManager<br/>策略/缓存 → ASK Future → 审批结果"]
+        TOOLS["内建工具<br/>read_file / write_file / list_dir / bash<br/>task_* / note_save"]
+        SUB["spawn_agent / agent_result<br/>独立 Context + Loop + EventBus<br/>角色配置 · 前台/后台 asyncio 任务"]
+        MCP["McpServerManager → McpTool → McpClient<br/>连接管理 · tools/list 发现 · tools/call 调用"]
+        BUS["EventBus<br/>进程内发布订阅 · 按注册顺序 await 订阅者"]
+        PUSH["IpcEventBroadcaster<br/>topic / run scope 过滤 · event.push"]
+        EW["EventWriter<br/>执行事件 JSONL"]
+        TRACE["TraceWriter + TracingProvider<br/>IPC / EventBus / LLM 三层记录"]
+        STORE["SessionStore / TaskManager<br/>会话 · 消息 · 笔记 · 任务文件存储"]
+
+        RPC -->|"agent.run / session.*"| SM
+        SM --> SK
+        SK -->|"提示覆盖 / 工具过滤"| RUN
+        SM --> RUN
+        SM --> STORE
+        SM -->|"session.compact"| COMP
+        RPC -->|"permission.respond"| PM
+        RPC -->|"event.subscribe / 历史回放"| PUSH
+        RUN --> CTX
+        RUN --> LOOP
+        RUN --> STORE
+        LOOP <--> CTX
+        LOOP --> LLM
+        LOOP --> INV
+        LOOP --> COMP
+        COMP --> LLM
+        INV --> PM
+        INV -->|"审批放行后调用"| TOOLS
+        INV -->|"审批放行后调用"| SUB
+        INV -->|"审批放行后调用"| MCP
+        TOOLS --> STORE
+        SUB -->|"复用模型与权限管理器"| LLM
+
+        SM -.-> BUS
+        RUN -.-> BUS
+        LOOP -.-> BUS
+        LLM -.->|"token / usage"| BUS
+        INV -.->|"工具进度 / permission.requested"| BUS
+        SUB -.->|"子事件桥接到父总线"| BUS
+        BUS -.-> PUSH
+        BUS -.-> EW
+        BUS -.-> TRACE
+        RPC -.-> TRACE
+        LLM -.->|"TracingProvider 包装"| TRACE
+    end
+
+    SC -->|"命令 / 响应"| RPC
+    PUSH -.->|"实时事件 / 权限请求"| SC
+
+    API["外部模型服务<br/>Anthropic SDK / 兼容端点"]
+    SERVER["外部 MCP Server<br/>stdio 子进程或 TCP 服务"]
+    WORK["项目工作目录<br/>文件读写 / Shell 执行"]
+    DISK[("本地文件持久化<br/>~/.kama/sessions/{sid}/meta.json · thread.jsonl · notes.md<br/>runs/{rid}/events.jsonl · .tasks/task_*.json<br/>~/.kama/traces/daemon.jsonl · policy.toml")]
+
+    LLM --> API
+    MCP -->|"JSON-RPC / stdio 或 TCP"| SERVER
+    TOOLS --> WORK
+    STORE --> DISK
+    EW --> DISK
+    TRACE --> DISK
+    PM -->|"始终允许/拒绝策略"| DISK
+
+    classDef client fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef runtime fill:#eef2ff,stroke:#6366f1,color:#312e81
+    classDef safety fill:#fff7ed,stroke:#ea580c,color:#7c2d12
+    classDef event fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef external fill:#f8fafc,stroke:#64748b,color:#334155
+    class TUI,CLI,SC client
+    class RPC,SM,SK,RUN,CTX,LOOP,LLM,COMP,SUB runtime
+    class INV,PM,TOOLS,MCP safety
+    class BUS,PUSH,EW,TRACE event
+    class STORE,API,SERVER,WORK,DISK external
+
+%% 源码依据（路径相对项目根目录）：
+%% 入口与依赖装配：pyproject.toml、src/kama_claude/core/app.py、core/runner.py
+%% 会话与记忆：core/session/manager.py、core/session/store.py、core/context.py、core/memory/loader.py
+%% 循环与模型：core/loop.py、core/llm/base.py、core/llm/provider.py
+%% 工具与审批：core/tools/invocation.py、core/tools/registry.py、core/permissions/manager.py
+%% 事件与传输：core/events/bus.py、core/events/writer.py、core/transport/*.py
+%% 扩展：core/skills/loader.py、core/subagent/tool.py、core/agents/loader.py、core/mcp/*.py
+%% 上下文：core/compact/compactor.py、core/compact/budget.py
+%% 观测：core/trace/provider.py、core/trace/writer.py
+%% 前端：src/kama_claude/tui/app.py、src/kama_claude/cli/commands/*.py
+%% 当前边界：
+%% 1. 自动压缩默认 auto_threshold=0，手动 /compact 由 TUI 单独发送 session.compact。
+%% 2. 同一 session 串行执行；不同 session / 后台子 Agent 可由 asyncio 并发运行。
+%% 3. 子 Agent 仅继承传入 prompt / 角色提示，复用 provider 与权限管理器；不继承父会话历史。
+%% 4. 子 Agent 的工具表单独构造，当前不自动注入 note_save 或 MCP 工具。
+%% 5. 会话文件已持久化，但 SessionManager 当前没有从磁盘恢复会话索引的启动流程。
+%% 6. EventBus 为进程内顺序 await 分发；不是外部消息队列。
+%% 7. McpTool.params_model=None，MCP 参数 schema 展示给模型，但本地不经 Pydantic 校验。
+%% 8. llm.router 为配置字段，当前 AnthropicProvider 实际使用 static 模型选择。
