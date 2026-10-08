@@ -964,6 +964,10 @@ class KamaTuiApp(App[None]):
             status = event.get("status", "")
             steps = event.get("steps", 0)
             reason = event.get("reason") or ""
+            if reason == "repeated_tool_failure":
+                reason = "repeated tool failures; unable to recover"
+            if reason == "timeout_state_unconfirmed":
+                reason = "timed-out operation state unconfirmed; execution stopped"
             if status == "success":
                 self._append(Static(
                     f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,6 +13,12 @@ from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
 
 # ── bash ──────────────────────────────────────────────────────────────────────
+
+
+# 按当前系统的 shell 规则引用 Python 命令，避免依赖 sleep 等平台专属程序
+def _python_command(*arguments: str) -> str:
+    parts = [sys.executable, *arguments]
+    return subprocess.list2cmdline(parts) if sys.platform == "win32" else shlex.join(parts)
 
 # 功能：验证成功命令的 stdout 出现在 ToolResult.content 中，is_error 为 False
 # 设计：用 echo 命令避免外部依赖，直接比较输出内容，无需 mock
@@ -29,12 +39,55 @@ async def test_bash_nonzero_exit_is_error() -> None:
 
 
 # 功能：验证命令超时后 is_error=True，error_type 为 "timeout"
-# 设计：timeout=1s 搭配 sleep 2 必然超时；验证 error_type 而非 content，避免超时消息格式耦合
+# 设计：使用当前解释器休眠避免 Windows 缺少 sleep；同时确认执行端已清理进程
 @pytest.mark.asyncio
 async def test_bash_timeout() -> None:
-    result = await BashTool().invoke({"command": "sleep 5", "timeout": 1})
+    result = await BashTool().invoke({
+        "command": _python_command("-c", "import time; time.sleep(5)"), "timeout": 1,
+    })
     assert result.is_error
     assert result.error_type == "timeout"
+    assert result.execution_stopped is True
+
+
+# 功能：Shell 超时或外层取消会停止子进程，保留已发生的修改并阻止其继续写入
+# 设计：真实子进程先写开始标记、等待后再写结束标记，确认进程清理不是仅杀掉外层 shell
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_bash_cleans_children_without_rolling_back(tmp_path: Path, cancel: bool) -> None:
+    child = tmp_path / "child.py"
+    started, finished = tmp_path / "started", tmp_path / "finished"
+    child.write_text(
+        "import sys, time\nfrom pathlib import Path\n"
+        "Path(sys.argv[1]).write_text('partial')\n"
+        "print('started', flush=True)\ntime.sleep(3)\n"
+        "Path(sys.argv[2]).write_text('done')\n", encoding="utf-8",
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys\n"
+        "subprocess.run([sys.executable, *sys.argv[1:]])\n", encoding="utf-8",
+    )
+    task = asyncio.create_task(BashTool().invoke({
+        "command": _python_command(str(parent), str(child), str(started), str(finished)),
+        "timeout": 10 if cancel else 1,
+    }))
+    if cancel:
+        for _ in range(100):
+            if started.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert started.exists()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        result = await task
+        assert result.error_type == "timeout"
+        assert result.execution_stopped is True
+        assert "started" in result.content
+    await asyncio.sleep(3.1)
+    assert started.read_text() == "partial"
+    assert not finished.exists()
 
 
 # 功能：验证 stderr 被合并到 stdout 输出中

@@ -109,7 +109,7 @@ class SessionManager:
                 skill = self._skill_loader.resolve(skill_name)
                 if skill is not None:
                     goal = self._skill_loader.render_prompt(skill, arguments)
-                    system_prompt_override = skill.system_prompt_template
+                    system_prompt_override = goal
                     tool_whitelist = skill.allowed_tools or None
                     await self._bus.publish(
                         SkillInvokedEvent(

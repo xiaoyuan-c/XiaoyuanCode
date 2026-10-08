@@ -29,6 +29,7 @@ class LoggingConfig:
 @dataclass
 class AgentConfig:
     max_steps: int = _DEFAULT_MAX_STEPS
+    auto_skills: bool = True
 
 
 @dataclass
@@ -51,7 +52,7 @@ class PermissionConfig:
 
 @dataclass
 class CompactionConfig:
-    auto_threshold: float = 0.0    # context_pct 触发自动压缩的阈值（0 表示禁用，推荐用手动 /compact）
+    auto_threshold: float = 0.0    # 自动压缩阈值；0 禁用，推荐手动 /compact
     tool_result_limit: int = 8_000  # tool_result 截断触发字符数
     tool_result_keep: int = 4_000   # 截断后保留的前缀字符数
 
@@ -117,7 +118,9 @@ def get_config() -> KamaConfig:
 
 # 将已解析的 TOML 根表写入 config；未知小节或类型错误时退出进程
 def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
-    unknown = set(data.keys()) - {"core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp"}
+    unknown = set(data.keys()) - {
+        "core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp",
+    }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
 
@@ -157,7 +160,7 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         agent = data["agent"]
         if not isinstance(agent, dict):
             raise SystemExit("Config error: [agent] must be a table")
-        unknown_agent: set[str] = set(agent.keys()) - {"max_steps"}
+        unknown_agent: set[str] = set(agent.keys()) - {"max_steps", "auto_skills"}
         if unknown_agent:
             raise SystemExit(f"Unknown [agent] keys: {', '.join(sorted(unknown_agent))}")
         if "max_steps" in agent:
@@ -165,6 +168,11 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, int) or val <= 0:
                 raise SystemExit("Config error: agent.max_steps must be a positive integer")
             config.agent.max_steps = val
+        if "auto_skills" in agent:
+            auto_skills = agent["auto_skills"]
+            if not isinstance(auto_skills, bool):
+                raise SystemExit("Config error: agent.auto_skills must be a boolean")
+            config.agent.auto_skills = auto_skills
 
     if "llm" in data:
         llm = data["llm"]
@@ -224,7 +232,9 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         comp = data["compaction"]
         if not isinstance(comp, dict):
             raise SystemExit("Config error: [compaction] must be a table")
-        unknown_comp: set[str] = set(comp.keys()) - {"auto_threshold", "tool_result_limit", "tool_result_keep"}
+        unknown_comp: set[str] = set(comp.keys()) - {
+            "auto_threshold", "tool_result_limit", "tool_result_keep",
+        }
         if unknown_comp:
             raise SystemExit(f"Unknown [compaction] keys: {', '.join(sorted(unknown_comp))}")
         if "auto_threshold" in comp:
@@ -235,12 +245,16 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         if "tool_result_limit" in comp:
             val = comp["tool_result_limit"]
             if not isinstance(val, int) or val <= 0:
-                raise SystemExit("Config error: compaction.tool_result_limit must be a positive integer")
+                raise SystemExit(
+                    "Config error: compaction.tool_result_limit must be a positive integer"
+                )
             config.compaction.tool_result_limit = val
         if "tool_result_keep" in comp:
             val = comp["tool_result_keep"]
             if not isinstance(val, int) or val <= 0:
-                raise SystemExit("Config error: compaction.tool_result_keep must be a positive integer")
+                raise SystemExit(
+                    "Config error: compaction.tool_result_keep must be a positive integer"
+                )
             config.compaction.tool_result_keep = val
 
     if "mcp" in data:
@@ -261,7 +275,9 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 raise SystemExit(f"Config error: mcp.servers[{i}].name must be a non-empty string")
             transport = srv.get("transport", "stdio")
             if transport not in ("stdio", "tcp"):
-                raise SystemExit(f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'")
+                raise SystemExit(
+                    f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'"
+                )
             s = McpServerConfig(name=name, transport=transport)
             if "command" in srv:
                 val = srv["command"]
@@ -332,6 +348,13 @@ def _apply_env(config: KamaConfig) -> None:
             )
 
     default_model = os.environ.get("KAMA_LLM_DEFAULT_MODEL")
+    auto_skills_env = os.environ.get("KAMA_AUTO_SKILLS")
+    if auto_skills_env is not None:
+        value = auto_skills_env.strip().lower()
+        if value not in ("0", "1", "false", "true", "no", "yes"):
+            raise SystemExit("Config error: KAMA_AUTO_SKILLS must be a boolean")
+        config.agent.auto_skills = value in ("1", "true", "yes")
+
     if default_model is not None:
         config.llm.default_model = default_model
 
@@ -367,7 +390,8 @@ def _apply_env(config: KamaConfig) -> None:
             compact_threshold_val = float(compact_threshold)
             if not (0.0 <= compact_threshold_val <= 1.0):
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_THRESHOLD must be between 0 and 1, got: {compact_threshold!r}"
+                    "Config error: KAMA_COMPACT_THRESHOLD must be between 0 and 1, "
+                    f"got: {compact_threshold!r}"
                 )
             config.compaction.auto_threshold = compact_threshold_val
         except ValueError:
@@ -381,12 +405,14 @@ def _apply_env(config: KamaConfig) -> None:
             compact_tool_limit_val = int(compact_tool_limit)
             if compact_tool_limit_val <= 0:
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_TOOL_LIMIT must be a positive integer, got: {compact_tool_limit!r}"
+                    "Config error: KAMA_COMPACT_TOOL_LIMIT must be a positive integer, "
+                    f"got: {compact_tool_limit!r}"
                 )
             config.compaction.tool_result_limit = compact_tool_limit_val
         except ValueError:
             raise SystemExit(
-                f"Config error: KAMA_COMPACT_TOOL_LIMIT must be an integer, got: {compact_tool_limit!r}"
+                "Config error: KAMA_COMPACT_TOOL_LIMIT must be an integer, "
+                f"got: {compact_tool_limit!r}"
             )
 
     compact_tool_keep = os.environ.get("KAMA_COMPACT_TOOL_KEEP")
@@ -395,10 +421,12 @@ def _apply_env(config: KamaConfig) -> None:
             compact_tool_keep_val = int(compact_tool_keep)
             if compact_tool_keep_val <= 0:
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_TOOL_KEEP must be a positive integer, got: {compact_tool_keep!r}"
+                    "Config error: KAMA_COMPACT_TOOL_KEEP must be a positive integer, "
+                    f"got: {compact_tool_keep!r}"
                 )
             config.compaction.tool_result_keep = compact_tool_keep_val
         except ValueError:
             raise SystemExit(
-                f"Config error: KAMA_COMPACT_TOOL_KEEP must be an integer, got: {compact_tool_keep!r}"
+                "Config error: KAMA_COMPACT_TOOL_KEEP must be an integer, "
+                f"got: {compact_tool_keep!r}"
             )

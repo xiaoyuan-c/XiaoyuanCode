@@ -23,6 +23,7 @@ from kama_claude.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from kama_claude.core.permissions.manager import PermissionManager
+    from kama_claude.core.tools.timeout_recovery import TimeoutRecovery
 
 _DEFAULT_TIMEOUT: float = 120.0
 _MAX_RETRIES: int = 2
@@ -44,6 +45,7 @@ async def _fail(
     elapsed_ms: int,
     *,
     attempt: int = 1,
+    execution_stopped: bool | None = None,
 ) -> ToolResult:
     await bus.publish(
         ToolCallFailedEvent(
@@ -57,7 +59,10 @@ async def _fail(
             ts=_now(),
         )
     )
-    return ToolResult(content=error_message, is_error=True, error_type=error_class)
+    return ToolResult(
+        content=error_message, is_error=True, error_type=error_class,
+        execution_stopped=execution_stopped,
+    )
 
 
 # 校验参数、检查权限、限时调用工具、发布进度事件，失败时指数退避重试，返回 ToolResult（不抛异常）
@@ -70,6 +75,7 @@ async def invoke_tool(
     *,
     permission_manager: PermissionManager | None = None,
     session_id: str = "",
+    timeout_recovery: TimeoutRecovery | None = None,
 ) -> ToolResult:
     t0 = time.monotonic()
 
@@ -83,6 +89,7 @@ async def invoke_tool(
         )
     )
 
+    # 计算本次调用已消耗的毫秒数
     def elapsed() -> int:
         return int((time.monotonic() - t0) * 1000)
 
@@ -100,6 +107,12 @@ async def invoke_tool(
             return await _fail(
                 bus, run_id, tool_call,
                 "schema_error", str(exc), elapsed(),
+            )
+
+    if timeout_recovery is not None:
+        if blocked := timeout_recovery.check(tool_call, tool):
+            return await _fail(
+                bus, run_id, tool_call, "recovery_required", blocked, elapsed(),
             )
 
     if permission_manager is not None:
@@ -141,15 +154,18 @@ async def invoke_tool(
                 elapsed(),
             )
 
+    confirmed_retry = timeout_recovery.reserve_retry(tool_call) if timeout_recovery else False
     for attempt in range(1, _MAX_RETRIES + 2):
         error_class: str | None = None
         error_message: str | None = None
+        execution_stopped: bool | None = None
 
         try:
             result = await asyncio.wait_for(
                 tool.invoke(dict(tool_call.input)), timeout=timeout
             )
             ms = elapsed()
+            execution_stopped = result.execution_stopped
 
             if result.is_error:
                 error_class = result.error_type or "runtime_error"
@@ -183,7 +199,7 @@ async def invoke_tool(
         assert error_class is not None and error_message is not None
         ms = elapsed()
 
-        if error_class in _RETRYABLE and attempt <= _MAX_RETRIES:
+        if error_class in _RETRYABLE and attempt <= _MAX_RETRIES and not confirmed_retry:
             await bus.publish(
                 ToolCallFailedEvent(
                     run_id=run_id,
@@ -203,6 +219,7 @@ async def invoke_tool(
             bus, run_id, tool_call,
             error_class, error_message, ms,
             attempt=attempt,
+            execution_stopped=execution_stopped,
         )
 
     # unreachable, but keeps mypy happy

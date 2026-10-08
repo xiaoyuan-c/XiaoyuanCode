@@ -104,3 +104,52 @@ async def test_closed_session_rejects_message(tmp_path: Path) -> None:
     with pytest.raises(HandlerError) as exc:
         await manager.send_message(session.id, "again")
     assert exc.value.code == SESSION_CLOSED
+
+
+# 功能：验证手动压缩也补回遗漏笔记，并保留可回读的原始记录
+# 设计：真实 manager/store 配合模拟摘要，覆盖手动入口不会绕过自动压缩的笔记保护
+async def test_manual_compact_preserves_notes_and_history(tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kama_claude.core.llm.types import LlmResponse
+
+    provider = MagicMock()
+    provider.chat = AsyncMock(return_value=LlmResponse(stop_reason="end_turn", text="Summary"))
+    store = SessionStore(tmp_path)
+    manager = SessionManager(store, lambda: _Runner(), EventBus(), provider=provider)  # type: ignore[arg-type]
+    session = await manager.create("chat")
+    store.append_message(session.id, "user", "Do not modify config.py")
+    store.append_note(session.id, "Do not modify config.py", "r")
+
+    await manager.compact(session.id)
+
+    history = await manager.get_history(session.id)
+    assert "Do not modify config.py" in history[0]["content"]
+    assert "Original history" in history[0]["content"]
+    assert len(list(store.session_dir(session.id).glob("history_*.jsonl"))) == 1
+    assert "Do not modify config.py" in store.read_notes(session.id)
+
+
+# 功能：显式 Skill 命令展开系统模板参数并传递白名单，仍允许仅手动 Skill
+# 设计：真实 SessionManager 调用捕获型 runner，验证手动入口优先于后端自动注册条件
+async def test_explicit_skill_expands_system_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    directory = tmp_path / ".kama" / "skills"
+    directory.mkdir(parents=True)
+    (directory / "review.md").write_text(
+        "---\nname: review\ndescription: Review code\ndisable-model-invocation: true\n"
+        "allowed_tools:\n  - read_file\n---\nReview exactly $ARGUMENTS",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    runner = MagicMock()
+    runner.run_and_capture = AsyncMock(return_value=RunOutcome("success", "done", None))
+    manager = SessionManager(SessionStore(tmp_path / "sessions"), lambda: runner, EventBus())
+    session = await manager.create("chat")
+
+    await manager.send_message(session.id, "/review src/main.py")
+
+    kwargs = runner.run_and_capture.call_args.kwargs
+    assert kwargs["system_prompt_override"] == "Review exactly src/main.py"
+    assert kwargs["tool_whitelist"] == ["read_file"]

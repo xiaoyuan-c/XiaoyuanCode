@@ -85,3 +85,31 @@ def test_priority_chain_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     cfg = get_config()
 
     assert cfg.port == 8000
+
+
+# 功能：自动 Skill 默认开启，TOML 可关闭，环境变量可再次覆盖
+# 设计：分别调用配置应用函数避免开发机已有配置干扰，验证布尔配置与优先级
+def test_auto_skills_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kama_claude.core.config import KamaConfig, _apply_env, _apply_toml
+
+    config = KamaConfig()
+    assert config.agent.auto_skills
+    _apply_toml(config, {"agent": {"auto_skills": False}})
+    assert not config.agent.auto_skills
+    monkeypatch.setenv("KAMA_AUTO_SKILLS", "true")
+    _apply_env(config)
+    assert config.agent.auto_skills
+
+
+# 功能：非法自动触发布尔配置会明确报错
+# 设计：分别覆盖 TOML 字符串和环境变量拼写错误，防止错误配置意外启用自动加载
+@pytest.mark.parametrize("source", ["toml", "env"])
+def test_auto_skills_invalid_config(monkeypatch: pytest.MonkeyPatch, source: str) -> None:
+    from kama_claude.core.config import KamaConfig, _apply_env, _apply_toml
+
+    with pytest.raises(SystemExit, match="must be a boolean"):
+        if source == "toml":
+            _apply_toml(KamaConfig(), {"agent": {"auto_skills": "false"}})
+        else:
+            monkeypatch.setenv("KAMA_AUTO_SKILLS", "typo")
+            _apply_env(KamaConfig())

@@ -11,6 +11,7 @@ class Skill:
     description: str
     system_prompt_template: str
     allowed_tools: list[str] = field(default_factory=list)
+    disable_model_invocation: bool = False
 
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -22,6 +23,7 @@ def _parse_skill_file(path: Path) -> Skill:
     name = path.stem
     description = ""
     allowed_tools: list[str] = []
+    disable_model_invocation = False
     body = text
 
     m = _FRONTMATTER_RE.match(text)
@@ -30,9 +32,12 @@ def _parse_skill_file(path: Path) -> Skill:
         body = text[m.end():]
         lines = front.splitlines()
         i = 0
+        in_allowed_tools = False
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
+            if stripped and not line.startswith((" ", "\t", "- ")):
+                in_allowed_tools = stripped.startswith(("allowed_tools:", "allowed-tools:"))
             if stripped.startswith("name:"):
                 name = stripped[len("name:"):].strip().strip('"').strip("'")
             elif stripped.startswith("description:"):
@@ -42,17 +47,27 @@ def _parse_skill_file(path: Path) -> Skill:
                     fold = val == ">"
                     parts: list[str] = []
                     i += 1
-                    while i < len(lines) and (lines[i].startswith(" ") or lines[i].startswith("\t")):
+                    while i < len(lines) and lines[i].startswith((" ", "\t")):
                         parts.append(lines[i].strip())
                         i += 1
                     description = (" ".join(parts) if fold else "\n".join(parts)).strip()
                     continue
                 else:
                     description = val
-            elif stripped.startswith("allowed_tools:"):
-                pass
-            elif stripped.startswith("- "):
-                allowed_tools.append(stripped[2:].strip())
+            elif stripped.startswith(("disable-model-invocation:", "disable_model_invocation:")):
+                value = stripped.split(":", 1)[1].strip().lower()
+                if value not in ("true", "false"):
+                    raise ValueError("disable-model-invocation must be true or false")
+                disable_model_invocation = value == "true"
+            elif stripped.startswith(("allowed_tools:", "allowed-tools:")):
+                value = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                if value:
+                    value = value.removeprefix("[").removesuffix("]")
+                    allowed_tools.extend(
+                        token.strip('"\'') for token in re.split(r"[\s,]+", value) if token
+                    )
+            elif stripped.startswith("- ") and in_allowed_tools:
+                allowed_tools.append(stripped[2:].strip().strip('"').strip("'"))
             i += 1
 
     return Skill(
@@ -60,6 +75,7 @@ def _parse_skill_file(path: Path) -> Skill:
         description=description,
         system_prompt_template=body.strip(),
         allowed_tools=allowed_tools,
+        disable_model_invocation=disable_model_invocation,
     )
 
 
@@ -114,13 +130,14 @@ class SkillLoader:
             Path(".kama/skills"),
         ]:
             if d.exists():
-                for f in sorted(d.glob("*.md")):
+                # 同一目录先读取目录式 Skill，再由扁平文件覆盖，与 resolve 的查找顺序一致
+                for f in sorted(d.glob("*/SKILL.md")):
                     try:
                         skill = _parse_skill_file(f)
                         seen[skill.name] = skill
                     except Exception:
                         pass
-                for f in sorted(d.glob("*/SKILL.md")):
+                for f in sorted(d.glob("*.md")):
                     try:
                         skill = _parse_skill_file(f)
                         seen[skill.name] = skill

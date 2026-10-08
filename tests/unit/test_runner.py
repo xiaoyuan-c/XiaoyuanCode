@@ -154,6 +154,21 @@ async def test_events_jsonl_created_with_started_and_finished(tmp_path: Path) ->
     assert event_types[-1] == "run.finished"
 
 
+# 功能：验证重复失败提前停止时事件和持久化日志均保留明确原因
+# 设计：把最大步数设为二十轮，确认第五轮结束来自重复失败保护而非原有步数上限
+async def test_repeated_failure_reason_published_and_recorded(tmp_path: Path) -> None:
+    provider = _LoopingProvider()
+    events = await _run(provider=provider, config=_config(max_steps=20), tmp_path=tmp_path)
+    finished = next(e for e in events if e.type == "run.finished")  # type: ignore[attr-defined]
+    assert finished.status == "failed"  # type: ignore[attr-defined]
+    assert finished.reason == "repeated_tool_failure"  # type: ignore[attr-defined]
+    assert provider._call == 5
+    log_file = next(tmp_path.rglob("events.jsonl"))
+    recorded = json.loads(log_file.read_text(encoding="utf-8").splitlines()[-1])
+    assert recorded["reason"] == "repeated_tool_failure"
+    assert recorded["steps"] == 5
+
+
 # 功能：验证 runner 在 runs_dir 下创建以 run_id 命名的子目录并写入 events.jsonl
 # 设计：检查 tmp_path 下只有一个子目录且该目录包含 events.jsonl，确认目录结构约定（runs/<run_id>/events.jsonl）
 async def test_run_creates_run_subdirectory(tmp_path: Path) -> None:
@@ -309,3 +324,71 @@ async def test_session_registers_note_save_tool(tmp_path: Path) -> None:
     await runner.run_and_capture("remember", run_id="run-1", session=session, store=store)
 
     assert "Use Python 3.12" in store.read_notes("sess-1")
+
+
+# 功能：验证自动压缩后最新笔记仍可见、原始历史可回读，下一轮会话能加载摘要和最终结果
+# 设计：真实 runner 执行 note_save→自动压缩→结束，模拟摘要遗漏约束，覆盖旧历史切片造成消息丢失的回归
+async def test_session_auto_compaction_preserves_notes_and_history(tmp_path: Path) -> None:
+    from kama_claude.core.llm.types import UsageStats
+    from kama_claude.core.session.model import Session
+    from kama_claude.core.session.store import SessionStore
+
+    class _CompactingProvider:
+        # 初始化执行轮数，用独立 run_id 区分正常调用和压缩调用
+        def __init__(self) -> None:
+            self.turns = 0
+
+        # 正常执行保存约束再结束，压缩调用故意省略约束以验证恢复机制
+        async def chat(
+            self,
+            messages: list[dict[str, object]],
+            tool_schemas: list[dict[str, object]],
+            bus: EventBus,
+            run_id: str,
+            *,
+            step: int = 0,
+            system: str | None = None,
+        ) -> LlmResponse:
+            if run_id == "compact":
+                assert tool_schemas == []
+                assert "Do not modify config.py" in str(messages)
+                return LlmResponse(stop_reason="end_turn", text="Task in progress")
+            self.turns += 1
+            if self.turns == 1:
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[ToolCallBlock(
+                        id="note-1", name="note_save",
+                        input={"content": "Do not modify config.py"},
+                    )],
+                    usage=UsageStats(input_tokens=100, output_tokens=30, context_pct=0.9),
+                )
+            assert system is not None and "Do not modify config.py" in system
+            assert "Do not modify config.py" in str(messages)
+            return LlmResponse(stop_reason="end_turn", text="Finished with config untouched")
+
+    store = SessionStore(tmp_path / "sessions")
+    session = Session(
+        id="s", mode="chat", status="active", title="", created_at="t", updated_at="t",
+    )
+    # 多条历史确保压缩后原先的 prefill_len 会超出摘要长度
+    for index in range(4):
+        store.append_message("s", "user", f"old request {index}")
+        store.append_message("s", "assistant", f"old reply {index}")
+    store.append_message("s", "user", "continue")
+    config = _config()
+    config.compaction.auto_threshold = 0.8
+    runner = AgentRunner(config, provider=_CompactingProvider(), runs_dir=tmp_path)
+
+    outcome = await runner.run_and_capture("continue", run_id="r", session=session, store=store)
+
+    assert outcome.status == "success"
+    history = store.read_messages("s")
+    assert "Task in progress" in str(history)
+    assert "Do not modify config.py" in str(history)
+    assert "Finished with config untouched" in str(history)
+    archives = list(store.session_dir("s").glob("history_*.jsonl"))
+    assert len(archives) == 1
+    original = [json.loads(line) for line in archives[0].read_text(encoding="utf-8").splitlines()]
+    assert original[0]["content"] == "old request 0"
+    assert original[-1]["content"][0]["type"] == "tool_result"

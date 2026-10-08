@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import sys
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -8,6 +11,39 @@ from kama_claude.core.tools.base import BaseTool, ToolResult
 
 _MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
 _DEFAULT_TIMEOUT = 60
+_CLEANUP_TIMEOUT = 5
+
+
+# 清理本次启动的进程树并等待输出管道结束；清理失败时保留未确认状态
+async def _stop_process_tree(proc: asyncio.subprocess.Process) -> bool:
+    try:
+        if sys.platform == "win32":
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(proc.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                code = await asyncio.wait_for(killer.wait(), timeout=_CLEANUP_TIMEOUT)
+            except TimeoutError:
+                killer.kill()
+                await killer.wait()
+                code = -1
+            stopped = code == 0
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stopped = True
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        await asyncio.wait_for(proc.wait(), timeout=_CLEANUP_TIMEOUT)
+        return stopped
+    except (OSError, TimeoutError):
+        return False
 
 
 class BashParams(BaseModel):
@@ -50,19 +86,29 @@ class BashTool(BaseTool):
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                start_new_session=sys.platform != "win32",
             )
+            communication = asyncio.create_task(proc.communicate())
             try:
                 stdout_bytes, _ = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                    asyncio.shield(communication), timeout=timeout
                 )
             except TimeoutError:
-                proc.kill()
-                await proc.communicate()
+                stopped, output = await _cleanup_command(proc, communication)
                 return ToolResult(
-                    content=f"[timeout after {timeout}s]",
+                    content=(
+                        f"[timeout after {timeout}s; process cleanup "
+                        f"{'confirmed' if stopped else 'unconfirmed'}]\n{output}\n"
+                        "Changes may already have occurred. Inspect the actual state "
+                        "before retrying; timeout does not roll back files."
+                    ),
                     is_error=True,
                     error_type="timeout",
+                    execution_stopped=stopped,
                 )
+            except asyncio.CancelledError:
+                await _cleanup_command(proc, communication)
+                raise
         except Exception as exc:
             return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
 
@@ -79,3 +125,17 @@ class BashTool(BaseTool):
                 error_type="runtime_error",
             )
         return ToolResult(content=output or "[no output]")
+
+
+# 超时或取消时清理进程并限时回收输出，防止继承管道的子进程让清理无限等待
+async def _cleanup_command(
+    proc: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes | None]],
+) -> tuple[bool, str]:
+    stopped = await _stop_process_tree(proc)
+    try:
+        stdout, _ = await asyncio.wait_for(communication, timeout=_CLEANUP_TIMEOUT)
+        output = stdout[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+        return stopped, output
+    except (TimeoutError, OSError):
+        return False, "[output unavailable during cleanup]"

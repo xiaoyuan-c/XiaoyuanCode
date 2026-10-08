@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from kama_claude.core.tools.timeout_recovery import TimeoutRecovery
+
 
 @dataclass
 class ExecutionContext:
@@ -20,6 +22,8 @@ class ExecutionContext:
     result: str = ""
     # skill 或 subagent 角色可覆盖默认 system prompt
     system_prompt_override: str | None = None
+    recovery_instruction: str = ""
+    timeout_recovery: TimeoutRecovery = field(default_factory=TimeoutRecovery)
 
     # 初始化消息历史，优先使用 session 完整回放内容
     def __post_init__(self) -> None:
@@ -41,6 +45,10 @@ class ExecutionContext:
                 + self.session_notes.strip()
                 + "\n\nRemember important durable facts by calling note_save."
             )
+        if self.recovery_instruction:
+            parts.append("\n\n## Runtime Recovery Instructions\n" + self.recovery_instruction)
+        if instruction := self.timeout_recovery.instruction():
+            parts.append("\n\n## Timeout State Verification\n" + instruction)
         return "".join(parts)
 
     # 将 LLM 响应的 content blocks 追加为 assistant 消息

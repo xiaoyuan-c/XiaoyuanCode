@@ -104,3 +104,58 @@ def test_project_overrides_global(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert skill is not None
     assert skill.description == "local override"
     assert "local system prompt" in skill.system_prompt_template
+
+
+# 功能：仅手动标志仍允许显式加载，且支持现有和标准风格的字段名
+# 设计：参数化两种字段拼写，加载真实文件而非构造 Skill 对象，覆盖解析与自动入口所需元数据
+@pytest.mark.parametrize("key", ["disable-model-invocation", "disable_model_invocation"])
+def test_manual_only_flag_parsed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+    directory = tmp_path / ".kama" / "skills"
+    directory.mkdir(parents=True)
+    (directory / "deploy.md").write_text(
+        f"---\nname: deploy\ndescription: Deploy app\n{key}: true\n---\nDeploy $ARGUMENTS",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    skill = SkillLoader().resolve("deploy")
+
+    assert skill is not None
+    assert skill.disable_model_invocation
+    assert skill.system_prompt_template == "Deploy $ARGUMENTS"
+
+
+# 功能：标准风格的内联白名单也能被解析，其他字段的列表不能混入工具白名单
+# 设计：覆盖空格串与内联数组，并添加无关列表，防止格式差异导致自动激活后限制失效
+@pytest.mark.parametrize("value", ["read_file list_dir", "[read_file, list_dir]"])
+def test_inline_tools_parsed(tmp_path: Path, value: str) -> None:
+    from kama_claude.core.skills.loader import _parse_skill_file
+
+    file = tmp_path / "review.md"
+    file.write_text(
+        f"---\nname: review\ndescription: Review code\nallowed-tools: {value}\n"
+        "tags:\n  - ignored\n---\nReview instructions",
+        encoding="utf-8",
+    )
+
+    assert _parse_skill_file(file).allowed_tools == ["read_file", "list_dir"]
+
+
+# 功能：同目录同时存在两种格式时，自动目录与显式命令加载相同模板
+# 设计：构造冲突的扁平文件和目录式 Skill，验证自动选择不会悄悄使用另一套指令和白名单
+def test_catalog_matches_explicit_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    directory = tmp_path / ".kama" / "skills"
+    (directory / "review").mkdir(parents=True)
+    (directory / "review.md").write_text(
+        "---\nname: review\ndescription: Flat review\n---\nFlat instructions",
+        encoding="utf-8",
+    )
+    (directory / "review" / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Directory review\n---\nDirectory instructions",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    loader = SkillLoader()
+    catalog_skill = next(skill for skill in loader.list_all_skills() if skill.name == "review")
+
+    assert catalog_skill == loader.resolve("review")
+    assert catalog_skill.system_prompt_template == "Flat instructions"

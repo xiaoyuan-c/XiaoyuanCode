@@ -5,6 +5,7 @@ allowed_tools:
   - read_file
   - list_dir
   - bash
+  - resolve_tool_timeout
 ---
 你是一位严格的代码审查员。请对以下目标路径进行全面的代码审查：
 

@@ -15,6 +15,7 @@ class ReadFileParams(BaseModel):
 
 
 class ReadFileTool(BaseTool):
+    read_only = True
     params_model = ReadFileParams
     name = "read_file"
     description = (

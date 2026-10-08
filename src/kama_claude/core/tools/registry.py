@@ -15,6 +15,12 @@ class ToolRegistry:
     def get(self, name: str) -> BaseTool | None:
         return self._tools.get(name)
 
+    # 收紧当前工具集合，仅保留白名单中的已注册工具，不扩大原有权限范围
+    def restrict(self, allowed_names: set[str]) -> None:
+        self._tools = {
+            name: tool for name, tool in self._tools.items() if name in allowed_names
+        }
+
     # 返回所有工具的 Anthropic 格式 schema 列表
     def tool_schemas(self) -> list[dict[str, object]]:
         return [

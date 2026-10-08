@@ -11,8 +11,9 @@ from pydantic import BaseModel
 class ToolResult:
     content: str
     is_error: bool = False
-    # "runtime_error" | "timeout" | "schema_error" | "permission_denied"
+    # timeout 和 recovery_required 不自动重试，其余错误类型按运行时策略处理
     error_type: str | None = None
+    execution_stopped: bool | None = None
 
 
 class BaseTool(ABC):
@@ -20,6 +21,7 @@ class BaseTool(ABC):
     description: str
     input_schema: dict[str, object]
     params_model: ClassVar[type[BaseModel] | None] = None
+    read_only: ClassVar[bool] = False
 
     # 执行工具调用，返回结果或错误
     @abstractmethod

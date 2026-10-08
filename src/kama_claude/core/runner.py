@@ -21,6 +21,8 @@ from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
+from kama_claude.core.skills.loader import SkillLoader
+from kama_claude.core.skills.tool import ActivateSkillTool
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
@@ -36,6 +38,7 @@ from kama_claude.core.tools.builtin import (
     WriteFileTool,
 )
 from kama_claude.core.tools.registry import ToolRegistry
+from kama_claude.core.tools.timeout_recovery import ResolveToolTimeoutTool
 from kama_claude.core.trace.provider import TracingProvider
 from kama_claude.core.trace.writer import TraceWriter
 
@@ -89,6 +92,7 @@ class AgentRunner:
         child_runs_dir: Path | None = None,
         session_id: str = "",
         tool_whitelist: list[str] | None = None,
+        context: ExecutionContext | None = None,
     ) -> ToolRegistry:
         allowed: set[str] | None = set(tool_whitelist) if tool_whitelist else None
 
@@ -96,6 +100,8 @@ class AgentRunner:
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
+        if context is not None and _ok("resolve_tool_timeout"):
+            registry.register(ResolveToolTimeoutTool(context.timeout_recovery))
         for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
             if _ok(t.name):
                 registry.register(t)
@@ -108,7 +114,7 @@ class AgentRunner:
             if _ok(t.name):
                 registry.register(t)
         if session is not None and store is not None and run_id is not None:
-            note_tool = NoteSaveTool(store, session.id, run_id)
+            note_tool = NoteSaveTool(store, session.id, run_id, context=context)
             if _ok(note_tool.name):
                 registry.register(note_tool)
         if provider is not None and bus is not None and run_id is not None:
@@ -133,6 +139,19 @@ class AgentRunner:
             for mcp_tool in self._mcp_manager.get_tools():
                 if _ok(mcp_tool.name):
                     registry.register(mcp_tool)
+        if (
+            self._config.agent.auto_skills
+            and context is not None
+            and context.system_prompt_override is None
+            and bus is not None
+            and _ok("activate_skill")
+        ):
+            skills = [
+                skill for skill in SkillLoader().list_all_skills()
+                if skill.description.strip() and not skill.disable_model_invocation
+            ]
+            if skills:
+                registry.register(ActivateSkillTool(skills, context, registry, bus))
         return registry
 
     # 执行一次完整的 agent run（委托给 run_and_capture，忽略返回值）
@@ -213,6 +232,7 @@ class AgentRunner:
                     child_runs_dir=child_runs_dir,
                     session_id=session_id_str,
                     tool_whitelist=tool_whitelist,
+                    context=context,
                 )
                 session_dir = (
                     store.session_dir(session.id)
@@ -250,7 +270,11 @@ class AgentRunner:
             )
 
         if session is not None and store is not None:
-            store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
+            if context.messages[:prefill_len] == history:
+                store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
+            else:
+                # 压缩会替换消息前缀，不能再按旧历史长度切片，否则会丢掉摘要和后续消息
+                store.write_compacted(session.id, context.messages)
 
         if cancelled:
             raise asyncio.CancelledError()

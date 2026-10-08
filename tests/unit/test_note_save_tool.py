@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from kama_claude.core.context import ExecutionContext
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.tools.builtin.note_save import NoteSaveTool
 
@@ -30,3 +31,18 @@ async def test_note_save_rejects_empty_content(tmp_path: Path) -> None:
     assert result.is_error
     assert result.error_type == "runtime_error"
     assert store.read_notes("sess-1") == ""
+
+
+# 功能：验证新保存的笔记在同一 Run 下一次模型调用前就进入系统提示
+# 设计：绑定真实上下文、连续写入约束和进度，检查两条内容均保留而非仅下一 Run 加载
+async def test_note_save_refreshes_current_context(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    tool = NoteSaveTool(store, "s", "r1", context=ctx)
+
+    await tool.invoke({"content": "Do not modify config.py"})
+    await tool.invoke({"content": "Parser complete; tests pending"})
+
+    assert ctx.session_notes == store.read_notes("s")
+    assert "Do not modify config.py" in ctx.system_prompt("BASE")
+    assert "Parser complete; tests pending" in ctx.system_prompt("BASE")

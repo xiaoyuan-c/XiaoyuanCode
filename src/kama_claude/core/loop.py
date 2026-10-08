@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -8,9 +9,11 @@ from kama_claude.core.bus.events import StepFinishedEvent, StepStartedEvent
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
+from kama_claude.core.llm.types import ToolCallBlock
+from kama_claude.core.loop_guard import RepeatedFailureGuard
+from kama_claude.core.tools.base import ToolResult
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
-import logging
 
 if TYPE_CHECKING:
     from kama_claude.core.compact.compactor import Compactor
@@ -19,12 +22,14 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+
+# 返回当前 UTC 时间的 ISO 8601 字符串
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
 class AgentLoop:
-    # 初始化循环所需依赖：LLM provider、工具注册表、事件总线，以及可选的权限管理器、压缩器和 session ID
+    # 初始化模型、工具、事件、权限、压缩及重复失败保护配置
     def __init__(
         self,
         provider: LLMProvider,
@@ -35,6 +40,8 @@ class AgentLoop:
         compactor: Compactor | None = None,
         compact_threshold: float = 0.80,
         session_id: str = "",
+        repeat_failure_threshold: int = 3,
+        replan_grace_steps: int = 2,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -43,9 +50,13 @@ class AgentLoop:
         self._compactor = compactor
         self._compact_threshold = compact_threshold
         self._session_id = session_id
+        self._repeat_failure_threshold = repeat_failure_threshold
+        self._replan_grace_steps = replan_grace_steps
 
     # 驱动 plan→act→observe 循环直到上下文终止；CancelledError 向上传播
     async def run(self, context: ExecutionContext) -> None:
+        guard = RepeatedFailureGuard(self._repeat_failure_threshold, self._replan_grace_steps)
+        context.recovery_instruction = ""
         while not context.is_done():
             context.step += 1
             await self._bus.publish(
@@ -89,31 +100,57 @@ class AgentLoop:
             context.add_assistant_message(blocks)
 
             # [act] execute each requested tool; errors become tool results so loop continues
+            outcomes: list[tuple[ToolCallBlock, ToolResult]] = []
             if response.stop_reason == "tool_use":
                 for tc in response.tool_calls:
                     result = await invoke_tool(
                         self._registry, tc, self._bus, context.run_id,
                         permission_manager=self._permission_manager,
                         session_id=self._session_id,
+                        timeout_recovery=context.timeout_recovery,
                     )
+                    context.timeout_recovery.observe(tc, result, self._registry.get(tc.name))
                     context.add_tool_result(tc.id, result.content, is_error=result.is_error)
+                    outcomes.append((tc, result))
             elif response.stop_reason == "max_tokens" and response.tool_calls:
                 # Output token limit hit mid-tool-call; input is incomplete.
                 # Add synthetic error results so the conversation stays balanced.
                 for tc in response.tool_calls:
                     context.add_tool_result(
                         tc.id,
-                        "Error: output token limit reached before this tool call could be completed. "
+                        "Error: output token limit reached before this tool call "
+                        "could be completed. "
                         "Please break the task into smaller steps and try again.",
                         is_error=True,
                     )
 
-            # Termination check — end_turn wins over max_steps if both hit on same step
-            if response.stop_reason == "end_turn":
+            # 整轮工具结果配对完成后再检查，内部重试和同轮重复调用不增加失败轮数
+            recovery_action = guard.observe(outcomes)
+            context.recovery_instruction = guard.guidance
+            if recovery_action == "replan":
+                log.warning(
+                    "Repeated tool failure; requesting replan run_id=%s step=%d",
+                    context.run_id, context.step,
+                )
+
+            # 正常结束和步数上限保持原有优先级，再检查重复失败提前终止
+            if context.timeout_recovery.stop_reason or (
+                response.stop_reason == "end_turn" and context.timeout_recovery.pending
+            ):
+                context.result = (
+                    context.timeout_recovery.stop_reason
+                    or "Timed-out operation state is unconfirmed. " + (response.text or "")
+                )
+                context.mark_failed("timeout_state_unconfirmed")
+            elif response.stop_reason == "end_turn":
                 context.result = response.text or ""
                 context.mark_success()
             elif context.step >= context.max_steps:
                 context.mark_failed("exceeded_max_steps")
+            elif recovery_action == "stop":
+                context.result = guard.detail
+                context.mark_failed("repeated_tool_failure")
+                log.warning("%s run_id=%s", guard.detail, context.run_id)
 
             # 工具结果追加完毕（messages 末尾为 user）后检查压缩，仅在 run 继续时触发
             # 此时压缩结果 [user_summary, assistant_ack] 对下一次 LLM 调用是合法输入

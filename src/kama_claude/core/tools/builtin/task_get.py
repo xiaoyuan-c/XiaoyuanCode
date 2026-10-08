@@ -7,6 +7,7 @@ from kama_claude.core.tools.base import BaseTool, ToolResult
 
 
 class TaskGetTool(BaseTool):
+    read_only = True
     name = "task_get"
     description = "Get full details of a task by its integer ID. Returns the task as JSON."
     input_schema: dict[str, object] = {

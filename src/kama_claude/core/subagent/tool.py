@@ -25,6 +25,7 @@ from kama_claude.core.tools.builtin.task_list import TaskListTool
 from kama_claude.core.tools.builtin.task_update import TaskUpdateTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
 from kama_claude.core.tools.registry import ToolRegistry
+from kama_claude.core.tools.timeout_recovery import ResolveToolTimeoutTool
 
 if TYPE_CHECKING:
     from kama_claude.core.llm.base import LLMProvider
@@ -135,7 +136,9 @@ class SpawnAgentTool(BaseTool):
 
         child_bus.subscribe(_bridge)
 
-        child_registry = self._build_child_registry(child_bus, child_run_id, profile)
+        child_registry = self._build_child_registry(
+            child_bus, child_run_id, profile, context=child_context,
+        )
         child_loop = AgentLoop(
             self._provider,
             child_registry,
@@ -223,6 +226,8 @@ class SpawnAgentTool(BaseTool):
         child_bus: EventBus,
         child_run_id: str,
         profile: AgentProfile | None,
+        *,
+        context: ExecutionContext | None = None,
     ) -> ToolRegistry:
         from kama_claude.core.task.manager import TaskManager
 
@@ -234,6 +239,8 @@ class SpawnAgentTool(BaseTool):
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
+        if context is not None and _allowed("resolve_tool_timeout"):
+            registry.register(ResolveToolTimeoutTool(context.timeout_recovery))
         _all_tools = [
             ReadFileTool(),
             BashTool(),
@@ -280,6 +287,7 @@ class AgentResultParams(BaseModel):
 
 # 查询后台 subagent 的执行状态和最终结果
 class AgentResultTool(BaseTool):
+    read_only = True
     name = "agent_result"
     description = (
         "Retrieve the result of a background sub-agent previously started with spawn_agent. "

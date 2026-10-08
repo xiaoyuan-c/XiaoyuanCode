@@ -203,3 +203,49 @@ def test_unknown_event_silently_ignored() -> None:
 
     app._handle_event({"type": "some.unknown.type", "run_id": "r", "ts": "t"})
     assert appended == []
+
+
+# 功能：自动激活 Skill 的事件在 TUI 中展示所选名称和目标
+# 设计：复用真实事件处理函数并捕获生成组件，确认自动入口沿用已有展示通道
+def test_skill_activation_visible_in_tui() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda widget: appended.append(widget)  # type: ignore[method-assign]
+
+    app._handle_event({
+        "type": "skill.invoked", "skill_name": "review", "arguments": "src/main.py",
+        "run_id": "r", "ts": "t",
+    })
+
+    assert len(appended) == 1
+    assert "/review" in appended[0].content
+    assert "src/main.py" in appended[0].content
+
+
+# 功能：重复失败保护终止任务时 TUI 显示可读的退出原因
+# 设计：通过真实事件处理入口捕获组件，确认界面解释失败而不是只显示内部错误码
+def test_repeated_failure_reason_visible_in_tui() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda widget: appended.append(widget)  # type: ignore[method-assign]
+
+    app._handle_event({
+        "type": "run.finished", "run_id": "r", "status": "failed",
+        "steps": 5, "reason": "repeated_tool_failure", "ts": "t",
+    })
+
+    assert "repeated tool failures; unable to recover" in appended[0].content
+    assert "5 steps" in appended[0].content
+
+
+# 功能：超时状态无法确认时 TUI 明确展示停止原因
+# 设计：直接走真实事件展示分支，保证用户不会把恢复终止误解为任务成功
+def test_unconfirmed_timeout_visible_in_tui() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda widget: appended.append(widget)  # type: ignore[method-assign]
+    app._handle_event({
+        "type": "run.finished", "run_id": "r", "status": "failed", "steps": 2,
+        "reason": "timeout_state_unconfirmed", "ts": "t",
+    })
+    assert "timed-out operation state unconfirmed" in appended[0].content
