@@ -581,6 +581,251 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 }
 ```
 
+### RunCancelCurrentCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "run.cancel_current",
+      "default": "run.cancel_current",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "RunCancelCurrentCommand",
+  "type": "object"
+}
+```
+
+### RunCancelCurrentResult
+
+| Field | Type | Required |
+|---|---|---|
+| `run_id` | `string` | yes |
+| `status` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "status"
+  ],
+  "title": "RunCancelCurrentResult",
+  "type": "object"
+}
+```
+
+### RunResumeCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "run.resume",
+      "default": "run.resume",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "run_id"
+  ],
+  "title": "RunResumeCommand",
+  "type": "object"
+}
+```
+
+### RunResumeResult
+
+| Field | Type | Required |
+|---|---|---|
+| `run_id` | `string` | yes |
+| `status` | `string` | yes |
+| `reason` | `string | null` | no |
+
+```json
+{
+  "properties": {
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    }
+  },
+  "required": [
+    "run_id",
+    "status"
+  ],
+  "title": "RunResumeResult",
+  "type": "object"
+}
+```
+
+### RunCheckpointGetCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "run.checkpoint_get",
+      "default": "run.checkpoint_get",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "run_id"
+  ],
+  "title": "RunCheckpointGetCommand",
+  "type": "object"
+}
+```
+
+### RunCheckpointGetResult
+
+| Field | Type | Required |
+|---|---|---|
+| `run_id` | `string` | yes |
+| `status` | `string` | yes |
+| `phase` | `string` | yes |
+| `step` | `integer` | yes |
+| `max_steps` | `integer` | yes |
+| `reason` | `string | null` | no |
+| `resume_count` | `integer` | yes |
+| `resumable` | `boolean` | yes |
+| `updated_at` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "phase": {
+      "title": "Phase",
+      "type": "string"
+    },
+    "step": {
+      "title": "Step",
+      "type": "integer"
+    },
+    "max_steps": {
+      "title": "Max Steps",
+      "type": "integer"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    },
+    "resume_count": {
+      "title": "Resume Count",
+      "type": "integer"
+    },
+    "resumable": {
+      "title": "Resumable",
+      "type": "boolean"
+    },
+    "updated_at": {
+      "title": "Updated At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "status",
+    "phase",
+    "step",
+    "max_steps",
+    "resume_count",
+    "resumable",
+    "updated_at"
+  ],
+  "title": "RunCheckpointGetResult",
+  "type": "object"
+}
+```
+
 ## Server Push
 
 Events pushed from daemon to subscribed clients over the same TCP connection.
@@ -720,6 +965,72 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
   "type": "run.started",
   "run_id": "20260516-100000-abc123",
   "goal": "\u603b\u7ed3 README.md",
+  "ts": "2026-05-16T10:00:00.001Z"
+}
+```
+
+### RunResumedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `from_phase` | `string` | yes |
+| `from_step` | `integer` | yes |
+| `resume_count` | `integer` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "run.resumed",
+      "default": "run.resumed",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "from_phase": {
+      "title": "From Phase",
+      "type": "string"
+    },
+    "from_step": {
+      "title": "From Step",
+      "type": "integer"
+    },
+    "resume_count": {
+      "title": "Resume Count",
+      "type": "integer"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "from_phase",
+    "from_step",
+    "resume_count",
+    "ts"
+  ],
+  "title": "RunResumedEvent",
+  "type": "object"
+}
+```
+
+**Example:**
+
+```json
+{
+  "type": "run.resumed",
+  "run_id": "20260516-100000-abc123",
+  "from_phase": "tool_started",
+  "from_step": 2,
+  "resume_count": 1,
   "ts": "2026-05-16T10:00:00.001Z"
 }
 ```

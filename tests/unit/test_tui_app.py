@@ -85,6 +85,27 @@ def test_run_started_appends_widget_with_content() -> None:
     assert "do the thing" in rendered
 
 
+# 功能：验证 run.resumed 事件会展示恢复来源的 step 和 checkpoint 阶段
+# 设计：直接走真实事件路由并捕获 Static 内容，确保用户能辨认这是续跑而不是新任务
+def test_run_resumed_shows_checkpoint_origin() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda widget: appended.append(widget)  # type: ignore[method-assign]
+
+    app._handle_event({
+        "type": "run.resumed",
+        "run_id": "run-old",
+        "from_step": 3,
+        "from_phase": "tool_started",
+        "resume_count": 1,
+        "ts": "t",
+    })
+
+    assert "run-old" in appended[0].content
+    assert "step=3" in appended[0].content
+    assert "tool_started" in appended[0].content
+
+
 # 功能：验证 run.finished success 追加包含 "completed" 的 widget
 # 设计：monkey-patch _append，检查 rendered 内容包含 completed 和 green
 def test_run_finished_success_shows_completed() -> None:
@@ -192,6 +213,28 @@ async def test_input_submit_appends_user_turn_and_disables_prompt() -> None:
     assert area.text == ""
     assert "agent is working" in area.border_title.lower()
     assert appended[0].content == "[bold]>[/bold] hello"
+
+
+# 功能：验证 TUI 的中断动作会向 daemon 发送当前 session 的取消命令
+# 设计：直接调用 worker 方法并用 fake client 捕获 RPC，隔离 Textual 按键调度细节
+async def test_cancel_current_sends_rpc_command() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    class _FakeClient:
+        async def send_command(self, method: str, params: dict) -> dict:
+            calls.append((method, params))
+            return {"run_id": "run-1", "status": "cancelled"}
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda widget: appended.append(widget)  # type: ignore[method-assign]
+    app._client = _FakeClient()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+
+    await app._do_cancel_current()  # type: ignore[attr-defined]
+
+    assert calls == [("run.cancel_current", {"session_id": "sess-1"})]
+    assert "checkpoint saved" in appended[-1].content
 
 
 # 功能：验证未知事件类型不抛异常也不追加任何 widget

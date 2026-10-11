@@ -18,6 +18,15 @@ class RunStartedEvent(BaseModel):
     ts: str  # ISO 8601
 
 
+class RunResumedEvent(BaseModel):
+    type: Literal["run.resumed"] = "run.resumed"
+    run_id: str
+    from_phase: str
+    from_step: int
+    resume_count: int
+    ts: str
+
+
 class RunFinishedEvent(BaseModel):
     type: Literal["run.finished"] = "run.finished"
     run_id: str
@@ -207,6 +216,7 @@ class SkillInvokedEvent(BaseModel):
 Event = Annotated[
     CoreStartedEvent
     | RunStartedEvent
+    | RunResumedEvent
     | RunFinishedEvent
     | StepStartedEvent
     | StepFinishedEvent

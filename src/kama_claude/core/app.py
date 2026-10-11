@@ -22,6 +22,12 @@ from kama_claude.core.bus.commands import (
     PermissionRespondCommand,
     PermissionRespondResult,
     PongResult,
+    RunCancelCurrentCommand,
+    RunCancelCurrentResult,
+    RunCheckpointGetCommand,
+    RunCheckpointGetResult,
+    RunResumeCommand,
+    RunResumeResult,
     SessionCloseCommand,
     SessionCloseResult,
     SessionCompactCommand,
@@ -148,6 +154,45 @@ class CoreApp:
         cmd = SessionCompactCommand.model_validate(params)
         result = await self._sessions.compact(cmd.session_id, cmd.focus)
         return result  # type: ignore[no-any-return]
+
+    # 取消 session 当前正在执行的 run，并等待其 checkpoint 写入完成
+    async def _run_cancel_current_handler(
+        self, params: dict[str, Any]
+    ) -> RunCancelCurrentResult:
+        assert self._sessions is not None
+        cmd = RunCancelCurrentCommand.model_validate(params)
+        run_id, status = await self._sessions.cancel_current(cmd.session_id)
+        return RunCancelCurrentResult(run_id=run_id, status=status)
+
+    # 从持久化 checkpoint 恢复指定 run 并同步等待续跑结束
+    async def _run_resume_handler(self, params: dict[str, Any]) -> RunResumeResult:
+        assert self._sessions is not None
+        cmd = RunResumeCommand.model_validate(params)
+        outcome = await self._sessions.resume_run(cmd.session_id, cmd.run_id)
+        return RunResumeResult(
+            run_id=cmd.run_id,
+            status=outcome.status,
+            reason=outcome.reason,
+        )
+
+    # 返回指定 run 的 checkpoint 摘要而不暴露完整模型消息和工具结果
+    async def _run_checkpoint_get_handler(
+        self, params: dict[str, Any]
+    ) -> RunCheckpointGetResult:
+        assert self._sessions is not None
+        cmd = RunCheckpointGetCommand.model_validate(params)
+        checkpoint = await self._sessions.get_checkpoint(cmd.session_id, cmd.run_id)
+        return RunCheckpointGetResult(
+            run_id=checkpoint.run_id,
+            status=checkpoint.status,
+            phase=checkpoint.phase,
+            step=checkpoint.step,
+            max_steps=checkpoint.max_steps,
+            reason=checkpoint.reason,
+            resume_count=checkpoint.resume_count,
+            resumable=checkpoint.status != "success",
+            updated_at=checkpoint.updated_at,
+        )
 
     # 关闭 session 并返回 closed 状态
     async def _session_close_handler(self, params: dict[str, Any]) -> SessionCloseResult:
@@ -279,6 +324,9 @@ class CoreApp:
         server.register("session.close", self._session_close_handler)
         server.register("permission.respond", self._permission_respond_handler)
         server.register("session.compact", self._session_compact_handler)
+        server.register("run.cancel_current", self._run_cancel_current_handler)
+        server.register("run.resume", self._run_resume_handler)
+        server.register("run.checkpoint_get", self._run_checkpoint_get_handler)
 
         addr = await server.start()
         logger.info("kama-core %s listening addr=%s", kama_claude.__version__, addr)

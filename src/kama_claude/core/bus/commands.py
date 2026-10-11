@@ -100,6 +100,46 @@ class SessionCompactResult(BaseModel):
     saved_tokens: int
 
 
+class RunCancelCurrentCommand(BaseModel):
+    type: Literal["run.cancel_current"] = "run.cancel_current"
+    session_id: str
+
+
+class RunCancelCurrentResult(BaseModel):
+    run_id: str
+    status: str
+
+
+class RunResumeCommand(BaseModel):
+    type: Literal["run.resume"] = "run.resume"
+    session_id: str
+    run_id: str
+
+
+class RunResumeResult(BaseModel):
+    run_id: str
+    status: str
+    reason: str | None = None
+
+
+class RunCheckpointGetCommand(BaseModel):
+    type: Literal["run.checkpoint_get"] = "run.checkpoint_get"
+    session_id: str
+    run_id: str
+
+
+class RunCheckpointGetResult(BaseModel):
+    run_id: str
+    status: str
+    phase: str
+    step: int
+    max_steps: int
+    reason: str | None = None
+    resume_count: int
+    resumable: bool
+    updated_at: str
+
+
 # 根据 type 字段决定命令类型的判别联合
 Command = Annotated[
     PingCommand
@@ -110,6 +150,9 @@ Command = Annotated[
     | SessionGetHistoryCommand
     | SessionCloseCommand
     | PermissionRespondCommand
-    | SessionCompactCommand,
+    | SessionCompactCommand
+    | RunCancelCurrentCommand
+    | RunResumeCommand
+    | RunCheckpointGetCommand,
     Discriminator("type"),
 ]

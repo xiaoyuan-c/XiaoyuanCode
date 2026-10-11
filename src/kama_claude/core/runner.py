@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kama_claude.core.bus.events import RunFinishedEvent, RunStartedEvent
+from kama_claude.core.bus.events import RunFinishedEvent, RunResumedEvent, RunStartedEvent
+from kama_claude.core.checkpoint import (
+    RunCheckpointer,
+    RunCheckpointStore,
+    repair_interrupted_tool_calls,
+    restore_pending_tool_calls,
+)
 from kama_claude.core.compact.compactor import Compactor
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
@@ -14,6 +20,7 @@ from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.provider import AnthropicProvider
+from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.memory.loader import load_context_file
@@ -47,6 +54,24 @@ from kama_claude.core.trace.writer import TraceWriter
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+# 从消息历史中提取最近一条 assistant 文本，供终态响应恢复使用
+def _last_assistant_text(messages: list[dict[str, object]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            return "".join(texts)
+    return ""
 
 
 @dataclass
@@ -179,7 +204,10 @@ class AgentRunner:
         store: SessionStore | None = None,
         system_prompt_override: str | None = None,
         tool_whitelist: list[str] | None = None,
+        resume: bool = False,
     ) -> RunOutcome:
+        if resume and run_id is None:
+            raise ValueError("run_id is required when resuming")
         run_id = run_id or new_run_id()
         if session is not None and store is not None:
             run_path = store.runs_dir(session.id) / run_id
@@ -191,6 +219,20 @@ class AgentRunner:
             notes = ""
         run_path.mkdir(parents=True, exist_ok=True)
 
+        checkpoint_store = RunCheckpointStore(run_path / "checkpoint.json")
+        previous_checkpoint = checkpoint_store.load() if resume else None
+        if resume and previous_checkpoint is None:
+            raise ValueError(f"checkpoint not found for run {run_id}")
+        if previous_checkpoint is not None:
+            if previous_checkpoint.run_id != run_id:
+                raise ValueError("checkpoint run_id does not match requested run")
+            expected_session_id = session.id if session is not None else ""
+            if previous_checkpoint.session_id != expected_session_id:
+                raise ValueError("checkpoint session_id does not match requested session")
+            goal = previous_checkpoint.goal
+            system_prompt_override = previous_checkpoint.system_prompt_override
+            tool_whitelist = previous_checkpoint.tool_whitelist
+
         global_ctx = load_context_file(Path("~/.kama/context.md").expanduser())
         project_ctx = load_context_file(Path(".kama/context.md"))
 
@@ -200,21 +242,104 @@ class AgentRunner:
         for h in self._extra_handlers:
             bus.subscribe(h)
 
-        context = ExecutionContext(
-            run_id=run_id,
-            goal=goal,
-            max_steps=self._config.agent.max_steps,
-            prefill_messages=history,
-            session_notes=notes,
-            global_context=global_ctx,
-            project_context=project_ctx,
-            system_prompt_override=system_prompt_override,
-        )
+        if previous_checkpoint is None:
+            context = ExecutionContext(
+                run_id=run_id,
+                goal=goal,
+                max_steps=self._config.agent.max_steps,
+                prefill_messages=history,
+                session_notes=notes,
+                global_context=global_ctx,
+                project_context=project_ctx,
+                system_prompt_override=system_prompt_override,
+            )
+        else:
+            context = ExecutionContext(
+                run_id=run_id,
+                goal=goal,
+                max_steps=max(
+                    previous_checkpoint.max_steps,
+                    previous_checkpoint.step + self._config.agent.max_steps,
+                ),
+                session_notes=notes,
+                global_context=global_ctx,
+                project_context=project_ctx,
+                messages=previous_checkpoint.messages,
+                step=previous_checkpoint.step,
+                system_prompt_override=system_prompt_override,
+            )
         prefill_len = len(history)
+
+        session_id_str = session.id if session is not None else ""
+        checkpointer = RunCheckpointer(
+            checkpoint_store,
+            session_id=session_id_str,
+            system_prompt_override=system_prompt_override,
+            tool_whitelist=tool_whitelist,
+            previous=previous_checkpoint,
+        )
+        terminal_response_recovered = False
+        resume_count = 0
+        if previous_checkpoint is None:
+            checkpointer.save(context, "created", [])
+        else:
+            previous_status = previous_checkpoint.status
+            previous_reason = previous_checkpoint.reason
+            pending_tool_calls = restore_pending_tool_calls(previous_checkpoint)
+            repaired_ids = repair_interrupted_tool_calls(context, pending_tool_calls)
+            context.status = "running"
+            context.reason = None
+            context.result = ""
+            recovery_parts = [
+                f"This run resumed from checkpoint phase '{previous_checkpoint.phase}'."
+            ]
+            if previous_status == "failed" and previous_reason:
+                recovery_parts.append(f"The previous attempt stopped because: {previous_reason}.")
+            if repaired_ids:
+                recovery_parts.append(
+                    "Some tool calls have an unknown final state. Inspect the current state "
+                    "before retrying any side-effecting operation."
+                )
+            context.recovery_instruction = " ".join(recovery_parts)
+            if (
+                previous_checkpoint.phase == "model_response"
+                and previous_checkpoint.last_stop_reason == "end_turn"
+                and not pending_tool_calls
+            ):
+                context.result = _last_assistant_text(context.messages)
+                context.mark_success()
+                terminal_response_recovered = True
+            resume_count = checkpointer.mark_resumed()
+            checkpointer.save(
+                context,
+                "resumed",
+                [],
+                previous_checkpoint.last_stop_reason,
+            )
+
+        # 将 AgentLoop 的关键执行阶段同步写入当前 run 的 checkpoint.json
+        def save_checkpoint(
+            current: ExecutionContext,
+            phase: str,
+            pending: list[ToolCallBlock] | None,
+            stop_reason: str | None,
+        ) -> None:
+            checkpointer.save(current, phase, pending, stop_reason)
 
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
-            await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
+            if previous_checkpoint is None:
+                await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
+            else:
+                await bus.publish(
+                    RunResumedEvent(
+                        run_id=run_id,
+                        from_phase=previous_checkpoint.phase,
+                        from_step=previous_checkpoint.step,
+                        resume_count=resume_count,
+                        ts=_now(),
+                    )
+                )
 
             cancelled = False
             try:
@@ -227,7 +352,6 @@ class AgentRunner:
                         self._trace,
                         include_payload=self._config.trace.include_llm_payload,
                     )
-                session_id_str = session.id if session is not None else ""
                 child_runs_dir = (
                     store.runs_dir(session.id)
                     if session is not None and store is not None
@@ -257,8 +381,10 @@ class AgentRunner:
                     compactor=compactor,
                     compact_threshold=self._config.compaction.auto_threshold,
                     session_id=session_id_str,
+                    checkpoint_callback=save_checkpoint,
                 )
-                await loop.run(context)
+                if not terminal_response_recovered:
+                    await loop.run(context)
             except asyncio.CancelledError:
                 cancelled = True
                 if not context.is_done():
@@ -270,6 +396,21 @@ class AgentRunner:
                 if not context.is_done():
                     context.mark_failed("llm_error")
 
+            if session is not None and store is not None:
+                if context.messages[:prefill_len] == history:
+                    store.append_messages(
+                        session.id, context.messages[prefill_len:], run_id=run_id
+                    )
+                else:
+                    # 压缩或恢复会替换消息前缀，此时覆盖为完整合法上下文以避免重复或丢失
+                    store.write_compacted(session.id, context.messages)
+
+            final_phase = "cancelled" if cancelled else "finished"
+            checkpointer.save(
+                context,
+                final_phase,
+                thread_committed=session is not None and store is not None,
+            )
             await bus.publish(
                 RunFinishedEvent(
                     run_id=run_id,
@@ -279,13 +420,6 @@ class AgentRunner:
                     ts=_now(),
                 )
             )
-
-        if session is not None and store is not None:
-            if context.messages[:prefill_len] == history:
-                store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
-            else:
-                # 压缩会替换消息前缀，不能再按旧历史长度切片，否则会丢掉摘要和后续消息
-                store.write_compacted(session.id, context.messages)
 
         if cancelled:
             raise asyncio.CancelledError()

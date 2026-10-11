@@ -53,6 +53,7 @@ Agent 这个东西，光看文章还不够。
 * 工具调用不是直接裸跑，而是有参数校验和权限审批
 * 执行过程不是黑盒，而是通过事件流实时展示到 TUI
 * 每一次 run 都能留下 events、trace、session 记录，方便复盘和排查
+* 长任务会在关键阶段写入 checkpoint，可主动中断，并在失败或 daemon 重启后续跑
 * 多轮会话不是简单拼接历史，而是有 thread、notes、context 分层记忆
 * 上下文快爆了，不是粗暴截断，而是有水位检测和 compact 压缩
 * 复杂任务可以交给子 Agent，外部工具可以通过 MCP 接进来
@@ -197,6 +198,7 @@ KamaClaude 的核心不是一个 prompt，而是一套完整的本地 Agent 运�
 * 我实现了 TUI 实时渲染、工具折叠块、权限审批卡片
 * 我实现了 Session、thread、notes 三层记忆体系
 * 我实现了上下文水位检测、tool_result 截断、自动 compact 和手动 compact
+* 我实现了 run 级 checkpoint、任务主动中断和副作用安全的断点续跑
 * 我实现了 Skills、Subagents、MCP 外部工具接入
 * 我用 pytest、mypy strict、ruff 保证项目质量
 * 我实现了守护进程 + 多客户端架构
@@ -219,6 +221,8 @@ KamaClaude 最大的亮点，是把 Claude Code 这类 AI 编程 Agent 背后的
 不是只展示最终答案，而是通过 `EventBus`、events、trace 和 TUI，把 token 流、工具调用、审批、上下文水位都实时展示并可回放；
 
 不是简单拼接聊天历史，而是用 session、thread、notes、context 和 compact 做上下文治理；
+
+不是让长任务失败后从头执行，而是在模型返回、工具执行前后和步骤完成时写入 checkpoint，支持 `Ctrl+G` 中断和 `/resume [session_id] run_id` 续跑；
 
 最后还支持 Skills、Subagents、MCP，把工作流、子 Agent 和外部工具统一接进同一套运行链路。
 

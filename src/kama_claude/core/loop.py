@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,10 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger(__name__)
+
+type CheckpointCallback = Callable[
+    [ExecutionContext, str, list[ToolCallBlock] | None, str | None], None
+]
 
 
 # 返回当前 UTC 时间的 ISO 8601 字符串
@@ -42,6 +47,7 @@ class AgentLoop:
         session_id: str = "",
         repeat_failure_threshold: int = 3,
         replan_grace_steps: int = 2,
+        checkpoint_callback: CheckpointCallback | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -52,13 +58,27 @@ class AgentLoop:
         self._session_id = session_id
         self._repeat_failure_threshold = repeat_failure_threshold
         self._replan_grace_steps = replan_grace_steps
+        self._checkpoint_callback = checkpoint_callback
+
+    # 将当前执行阶段交给 runner 的持久化回调，未配置时保持原有行为
+    def _checkpoint(
+        self,
+        context: ExecutionContext,
+        phase: str,
+        pending_tool_calls: list[ToolCallBlock] | None = None,
+        last_stop_reason: str | None = None,
+    ) -> None:
+        if self._checkpoint_callback is not None:
+            self._checkpoint_callback(
+                context, phase, pending_tool_calls, last_stop_reason
+            )
 
     # 驱动 plan→act→observe 循环直到上下文终止；CancelledError 向上传播
     async def run(self, context: ExecutionContext) -> None:
         guard = RepeatedFailureGuard(self._repeat_failure_threshold, self._replan_grace_steps)
-        context.recovery_instruction = ""
         while not context.is_done():
             context.step += 1
+            self._checkpoint(context, "step_started", [])
             await self._bus.publish(
                 StepStartedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )
@@ -80,13 +100,18 @@ class AgentLoop:
                 )
             except asyncio.CancelledError:
                 context.mark_failed("cancelled")
+                self._checkpoint(context, "cancelled")
                 raise
             except Exception:
                 logging.getLogger(__name__).exception(
                     "LLM call failed run_id=%s step=%d", context.run_id, context.step
                 )
                 context.mark_failed("llm_error")
+                self._checkpoint(context, "llm_failed")
                 break
+
+            # 恢复说明只用于中断后的第一次模型调用，避免后续每轮重复注入
+            context.recovery_instruction = ""
 
             # [observe] append assistant content blocks to context
             # thinking blocks must come first and be preserved verbatim for extended thinking mode
@@ -98,11 +123,23 @@ class AgentLoop:
                     {"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input}
                 )
             context.add_assistant_message(blocks)
+            self._checkpoint(
+                context,
+                "model_response",
+                list(response.tool_calls),
+                response.stop_reason,
+            )
 
             # [act] execute each requested tool; errors become tool results so loop continues
             outcomes: list[tuple[ToolCallBlock, ToolResult]] = []
             if response.stop_reason == "tool_use":
-                for tc in response.tool_calls:
+                for index, tc in enumerate(response.tool_calls):
+                    self._checkpoint(
+                        context,
+                        "tool_started",
+                        list(response.tool_calls[index:]),
+                        response.stop_reason,
+                    )
                     result = await invoke_tool(
                         self._registry, tc, self._bus, context.run_id,
                         permission_manager=self._permission_manager,
@@ -112,6 +149,12 @@ class AgentLoop:
                     context.timeout_recovery.observe(tc, result, self._registry.get(tc.name))
                     context.add_tool_result(tc.id, result.content, is_error=result.is_error)
                     outcomes.append((tc, result))
+                    self._checkpoint(
+                        context,
+                        "tool_result",
+                        list(response.tool_calls[index + 1:]),
+                        response.stop_reason,
+                    )
             elif response.stop_reason == "max_tokens" and response.tool_calls:
                 # Output token limit hit mid-tool-call; input is incomplete.
                 # Add synthetic error results so the conversation stays balanced.
@@ -123,6 +166,9 @@ class AgentLoop:
                         "Please break the task into smaller steps and try again.",
                         is_error=True,
                     )
+                self._checkpoint(
+                    context, "tool_result", [], response.stop_reason
+                )
 
             # 整轮工具结果配对完成后再检查，内部重试和同轮重复调用不增加失败轮数
             recovery_action = guard.observe(outcomes)
@@ -163,7 +209,11 @@ class AgentLoop:
                 and response.usage.context_pct >= self._compact_threshold
             ):
                 await self._compactor.compact(context, self._provider)
+                self._checkpoint(
+                    context, "context_compacted", [], response.stop_reason
+                )
 
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )
+            self._checkpoint(context, "step_finished", [], response.stop_reason)

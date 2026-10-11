@@ -466,6 +466,7 @@ class KamaTuiApp(App[None]):
 
     TITLE = "KamaClaude"
     BINDINGS = [
+        Binding("ctrl+g", "cancel_current", "interrupt"),
         Binding("ctrl+q", "quit", "quit"),
     ]
     CSS = """
@@ -498,7 +499,7 @@ class KamaTuiApp(App[None]):
         "[bold cyan]██╔═██╗ ██╔══██║██║╚██╔╝██║██╔══██║██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  [/bold cyan]\n"
         "[bold cyan]██║  ██╗██║  ██║██║ ╚═╝ ██║██║  ██║╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗[/bold cyan]\n"
         "[bold cyan]╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝[/bold cyan]\n"
-        "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  Ctrl+C 退出[/dim]"
+        "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  Ctrl+G 中断  ·  Ctrl+Q 退出[/dim]"
     )
 
     # 初始化连接参数和 TUI 内部状态
@@ -533,7 +534,10 @@ class KamaTuiApp(App[None]):
 
     # 构建斜杠命令候选列表：内建命令 + 所有已注册 skill
     def _build_slash_items(self) -> list[tuple[str, str]]:
-        items: list[tuple[str, str]] = [("compact", "compress context window")]
+        items: list[tuple[str, str]] = [
+            ("compact", "compress context window"),
+            ("resume", "resume [session_id] run_id from checkpoint"),
+        ]
         try:
             loader = SkillLoader()
             for skill in loader.list_all_skills():
@@ -605,10 +609,20 @@ class KamaTuiApp(App[None]):
     async def action_quit(self) -> None:
         if self._client is not None and self._session_id is not None:
             try:
+                if self._busy:
+                    await self._client.send_command(
+                        "run.cancel_current", {"session_id": self._session_id}
+                    )
                 await self._client.send_command("session.close", {"session_id": self._session_id})
             except (IpcError, RuntimeError, OSError):
                 self._append(Static("[yellow]warning: failed to close session[/yellow]"))
         self.exit()
+
+    # 响应 Ctrl+G，在不关闭会话的前提下请求中断当前 run
+    async def action_cancel_current(self) -> None:
+        if self._client is None or self._session_id is None or not self._busy:
+            return
+        self.run_worker(self._do_cancel_current(), name="cancel_current", exclusive=False)
 
     # 将输入框提交内容发送给当前 chat session；用 worker 发送，避免 await 阻塞 App 消息泵
     async def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
@@ -620,6 +634,30 @@ class KamaTuiApp(App[None]):
             event.text_area.text = ""
             if self._client is not None and self._session_id is not None and not self._busy:
                 self.run_worker(self._do_compact(), name="compact", exclusive=False)
+            return
+        if content.startswith("/resume "):
+            parts = content.split()
+            if len(parts) not in {2, 3}:
+                self._append(Static(
+                    "[yellow]usage: /resume [session_id] run_id[/yellow]",
+                    classes="log-line",
+                ))
+                return
+            session_id = self._session_id if len(parts) == 2 else parts[1]
+            run_id = parts[-1]
+            if self._client is None or session_id is None or self._busy:
+                self._append(Static(
+                    "[yellow]agent busy or disconnected[/yellow]", classes="log-line"
+                ))
+                return
+            event.text_area.text = ""
+            self._busy = True
+            event.text_area.disabled = True
+            event.text_area.border_title = "resuming task..."
+            self._update_header("running")
+            self.run_worker(
+                self._do_resume(session_id, run_id), name="resume_run", exclusive=False
+            )
             return
         if self._client is None or self._session_id is None or self._busy:
             self._append(Static("[yellow]agent busy or disconnected[/yellow]", classes="log-line"))
@@ -654,6 +692,48 @@ class KamaTuiApp(App[None]):
             ))
         except (IpcError, RuntimeError, OSError) as e:
             self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
+
+    # 向 daemon 发送当前任务取消命令，并在 checkpoint 落盘后提示用户
+    async def _do_cancel_current(self) -> None:
+        if self._client is None or self._session_id is None:
+            return
+        self._append(Static("[yellow]interrupting current task...[/yellow]", classes="log-line"))
+        try:
+            result = await self._client.send_command(
+                "run.cancel_current", {"session_id": self._session_id}
+            )
+            run_id = result.get("run_id", "")
+            self._append(Static(
+                f"[yellow]task interrupted[/yellow]  [dim]{run_id} checkpoint saved[/dim]",
+                classes="log-line",
+            ))
+        except (IpcError, RuntimeError, OSError) as error:
+            self._append(Static(f"[red]interrupt error: {error}[/red]", classes="log-line"))
+
+    # 从指定 session 的 checkpoint 恢复 run，并将 TUI 切换回该会话
+    async def _do_resume(self, session_id: str, run_id: str) -> None:
+        if self._client is None:
+            return
+        previous_session_id = self._session_id
+        self._session_id = session_id
+        self._append(Static(
+            f"[cyan]resuming checkpoint[/cyan]  [dim]{session_id} / {run_id}[/dim]",
+            classes="log-line",
+        ))
+        try:
+            await self._client.send_command(
+                "run.resume", {"session_id": session_id, "run_id": run_id}
+            )
+        except (IpcError, RuntimeError, OSError) as error:
+            self._session_id = previous_session_id
+            self._busy = False
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = False
+                prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
+                prompt.focus()
+            self._update_header("ready")
+            self._append(Static(f"[red]resume error: {error}[/red]", classes="log-line"))
 
     # 在 worker 中执行 IPC 发送，使 App 消息泵在 agent 运行期间仍能处理键盘/焦点等消息
     async def _do_send_message(self, content: str) -> None:
@@ -881,6 +961,16 @@ class KamaTuiApp(App[None]):
             goal = event.get("goal", "")
             self._append(Static(
                 f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
+                classes="run-header",
+            ))
+
+        elif t == "run.resumed":
+            run_id = event.get("run_id", "")
+            from_step = event.get("from_step", 0)
+            from_phase = event.get("from_phase", "")
+            self._append(Static(
+                f"[dim]resume[/dim]  [cyan]{run_id}[/cyan]  "
+                f"[dim]step={from_step} phase={from_phase}[/dim]",
                 classes="run-header",
             ))
 

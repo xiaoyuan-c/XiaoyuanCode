@@ -32,6 +32,10 @@ class SessionStore:
     def runs_dir(self, sid: str) -> Path:
         return self.session_dir(sid) / "runs"
 
+    # 返回指定 session 的 meta.json 是否存在
+    def meta_exists(self, sid: str) -> bool:
+        return (self.session_dir(sid) / "meta.json").is_file()
+
     # 将 session meta 写入 meta.json
     def write_meta(self, session: Session) -> None:
         path = self.session_dir(session.id)
