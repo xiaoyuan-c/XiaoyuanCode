@@ -18,6 +18,8 @@ from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.permissions.manager import PermissionManager
+from kama_claude.core.rag.service import RagService
+from kama_claude.core.rag.tools import KnowledgeReadTool, KnowledgeSearchTool
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
@@ -67,6 +69,7 @@ class AgentRunner:
         trace: TraceWriter | None = None,
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
+        rag_service: RagService | None = None,
     ) -> None:
         self._config = config
         self._bus = bus
@@ -76,6 +79,7 @@ class AgentRunner:
         self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
+        self._rag_service = rag_service
         # 跨 run 共享的后台 subagent 任务注册表
         self._task_registry = BackgroundTaskRegistry()
 
@@ -139,6 +143,13 @@ class AgentRunner:
             for mcp_tool in self._mcp_manager.get_tools():
                 if _ok(mcp_tool.name):
                     registry.register(mcp_tool)
+        if self._rag_service is not None:
+            for rag_tool in (
+                KnowledgeSearchTool(self._rag_service),
+                KnowledgeReadTool(self._rag_service),
+            ):
+                if _ok(rag_tool.name):
+                    registry.register(rag_tool)
         if (
             self._config.agent.auto_skills
             and context is not None

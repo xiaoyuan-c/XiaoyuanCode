@@ -18,6 +18,13 @@ dependencies = [
     "httpx[socks]>=0.28.1",
 ]
 
+[project.optional-dependencies]
+rag = [
+    "faiss-cpu>=1.8",
+    "numpy>=1.26",
+    "sentence-transformers>=3.0",
+]
+
 # 安装后可在 PATH 中执行的入口：`kama` / `kama-core` / `kama-tui`
 [project.scripts]
 kama = "kama_claude.cli.main:main"

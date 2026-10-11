@@ -17,6 +17,9 @@ _DEFAULT_CONFIG_PATH = "~/.kama/config.toml"
 _DEFAULT_MAX_STEPS = 20
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_TRACE_FILE = "~/.kama/traces/daemon.jsonl"
+_DEFAULT_RAG_INDEX_DIR = "workspace/rag/obsidian"
+_DEFAULT_RAG_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+_DEFAULT_RAG_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 
 @dataclass
@@ -74,6 +77,25 @@ class McpConfig:
 
 
 @dataclass
+class RagConfig:
+    enabled: bool = False
+    vault_path: str = ""
+    index_dir: str = _DEFAULT_RAG_INDEX_DIR
+    embedding_model: str = _DEFAULT_RAG_EMBEDDING_MODEL
+    reranker_model: str = _DEFAULT_RAG_RERANKER_MODEL
+    chunk_size: int = 1_200
+    chunk_overlap: int = 150
+    candidate_k: int = 30
+    top_k: int = 5
+    rrf_k: int = 60
+    hierarchical: bool = True
+    note_candidate_k: int = 8
+    excluded_dirs: list[str] = field(
+        default_factory=lambda: [".obsidian", ".trash", ".learning-agent"]
+    )
+
+
+@dataclass
 class KamaConfig:
     host: str = _DEFAULT_HOST
     port: int = _DEFAULT_PORT
@@ -84,6 +106,7 @@ class KamaConfig:
     permission: PermissionConfig = field(default_factory=PermissionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    rag: RagConfig = field(default_factory=RagConfig)
 
 
 # 构建并返回运行时配置：默认值 → 全局 TOML → 项目本地 TOML → .env → 系统环境变量（后者优先级最高）
@@ -119,7 +142,7 @@ def get_config() -> KamaConfig:
 # 将已解析的 TOML 根表写入 config；未知小节或类型错误时退出进程
 def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
     unknown = set(data.keys()) - {
-        "core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp",
+        "core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp", "rag",
     }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -306,6 +329,56 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 s.port = val
             config.mcp.servers.append(s)
 
+    if "rag" in data:
+        rag = data["rag"]
+        if not isinstance(rag, dict):
+            raise SystemExit("Config error: [rag] must be a table")
+        allowed_rag_keys = {
+            "enabled", "vault_path", "index_dir", "embedding_model", "reranker_model",
+            "chunk_size", "chunk_overlap", "candidate_k", "top_k", "rrf_k",
+            "hierarchical", "note_candidate_k", "excluded_dirs",
+        }
+        unknown_rag = set(rag.keys()) - allowed_rag_keys
+        if unknown_rag:
+            raise SystemExit(f"Unknown [rag] keys: {', '.join(sorted(unknown_rag))}")
+        for key in ("enabled", "hierarchical"):
+            if key in rag:
+                val = rag[key]
+                if not isinstance(val, bool):
+                    raise SystemExit(f"Config error: rag.{key} must be a boolean")
+                setattr(config.rag, key, val)
+        for key in ("vault_path", "index_dir", "embedding_model", "reranker_model"):
+            if key in rag:
+                val = rag[key]
+                if not isinstance(val, str):
+                    raise SystemExit(f"Config error: rag.{key} must be a string")
+                setattr(config.rag, key, val)
+        for key in (
+            "chunk_size", "chunk_overlap", "candidate_k", "top_k", "rrf_k",
+            "note_candidate_k",
+        ):
+            if key in rag:
+                val = rag[key]
+                if not isinstance(val, int) or val < 0:
+                    raise SystemExit(f"Config error: rag.{key} must be a non-negative integer")
+                setattr(config.rag, key, val)
+        if config.rag.chunk_size <= 0:
+            raise SystemExit("Config error: rag.chunk_size must be a positive integer")
+        if config.rag.chunk_overlap >= config.rag.chunk_size:
+            raise SystemExit("Config error: rag.chunk_overlap must be smaller than rag.chunk_size")
+        for key in ("candidate_k", "top_k", "rrf_k", "note_candidate_k"):
+            if getattr(config.rag, key) <= 0:
+                raise SystemExit(f"Config error: rag.{key} must be a positive integer")
+        if config.rag.top_k > config.rag.candidate_k:
+            raise SystemExit("Config error: rag.top_k must not exceed rag.candidate_k")
+        if "excluded_dirs" in rag:
+            excluded_dirs = rag["excluded_dirs"]
+            if not isinstance(excluded_dirs, list) or not all(
+                isinstance(item, str) for item in excluded_dirs
+            ):
+                raise SystemExit("Config error: rag.excluded_dirs must be an array of strings")
+            config.rag.excluded_dirs = excluded_dirs
+
 
 # 用 KAMA_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: KamaConfig) -> None:
@@ -430,3 +503,18 @@ def _apply_env(config: KamaConfig) -> None:
                 "Config error: KAMA_COMPACT_TOOL_KEEP must be an integer, "
                 f"got: {compact_tool_keep!r}"
             )
+
+    rag_enabled = os.environ.get("KAMA_RAG_ENABLED")
+    if rag_enabled is not None:
+        value = rag_enabled.strip().lower()
+        if value not in ("0", "1", "false", "true", "no", "yes"):
+            raise SystemExit("Config error: KAMA_RAG_ENABLED must be a boolean")
+        config.rag.enabled = value in ("1", "true", "yes")
+
+    rag_vault_path = os.environ.get("KAMA_RAG_VAULT_PATH")
+    if rag_vault_path is not None:
+        config.rag.vault_path = rag_vault_path
+
+    rag_index_dir = os.environ.get("KAMA_RAG_INDEX_DIR")
+    if rag_index_dir is not None:
+        config.rag.index_dir = rag_index_dir

@@ -41,6 +41,7 @@ from kama_claude.core.logging_setup import setup_logging
 from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
+from kama_claude.core.rag.service import RagService
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import events_file, new_run_id
 from kama_claude.core.session import SessionManager, SessionStore
@@ -67,6 +68,7 @@ class CoreApp:
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
+        self._rag_service: RagService | None = None
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -240,6 +242,14 @@ class CoreApp:
             logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
             await self._mcp_manager.start_all(self._config.mcp.servers)
 
+        if self._config.rag.enabled:
+            self._rag_service = RagService(self._config.rag)
+            logger.info(
+                "rag: enabled vault=%s index=%s",
+                self._config.rag.vault_path,
+                self._config.rag.index_dir,
+            )
+
         self._sessions = SessionManager(
             store,
             runner_factory=lambda: AgentRunner(
@@ -248,6 +258,7 @@ class CoreApp:
                 trace=self._trace,
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
+                rag_service=self._rag_service,
             ),
             bus=self._bus,
             provider=compact_provider,

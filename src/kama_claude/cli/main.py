@@ -6,6 +6,7 @@ import sys
 from kama_claude.cli.commands.chat import cmd_chat
 from kama_claude.cli.commands.core import cmd_core_start, cmd_core_status, cmd_core_stop
 from kama_claude.cli.commands.ping import cmd_ping
+from kama_claude.cli.commands.rag import cmd_rag_index, cmd_rag_search, cmd_rag_status
 from kama_claude.cli.commands.run import cmd_run
 from kama_claude.cli.commands.trace import cmd_trace
 from kama_claude.cli.commands.version import cmd_version
@@ -37,6 +38,15 @@ def main() -> None:
     trace_parser.add_argument("--direction", help="Filter by direction (e.g. CORE→LLM)")
     trace_parser.add_argument("--raw", action="store_true", help="Output raw NDJSON")
     trace_parser.add_argument("--follow", "-f", action="store_true", help="Follow new records")
+
+    rag_parser = subparsers.add_parser("rag", help="Manage the local Obsidian RAG index")
+    rag_sub = rag_parser.add_subparsers(dest="rag_command")
+    rag_index_parser = rag_sub.add_parser("index", help="Build or update the RAG index")
+    rag_index_parser.add_argument("--force", action="store_true", help="Rebuild every vector")
+    rag_sub.add_parser("status", help="Show RAG index status")
+    rag_search_parser = rag_sub.add_parser("search", help="Test knowledge retrieval")
+    rag_search_parser.add_argument("query", help="Question or keywords to search")
+    rag_search_parser.add_argument("--top-k", type=int, default=5, help="Number of results")
 
     args = parser.parse_args()
 
@@ -72,6 +82,16 @@ def main() -> None:
             raw=args.raw,
             follow=args.follow,
         )
+    elif args.command == "rag":
+        if args.rag_command == "index":
+            cmd_rag_index(config, force=args.force)
+        elif args.rag_command == "status":
+            cmd_rag_status(config)
+        elif args.rag_command == "search":
+            cmd_rag_search(config, args.query, top_k=args.top_k)
+        else:
+            rag_parser.print_help()
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)

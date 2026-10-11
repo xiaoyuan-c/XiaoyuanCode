@@ -45,6 +45,8 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "note_save":  ToolPolicy(default=PermissionDecision.ALLOW),
     "activate_skill": ToolPolicy(default=PermissionDecision.ALLOW),
     "resolve_tool_timeout": ToolPolicy(default=PermissionDecision.ALLOW),
+    "knowledge_search": ToolPolicy(default=PermissionDecision.ALLOW),
+    "knowledge_read": ToolPolicy(default=PermissionDecision.ALLOW),
 }
 
 # 未在 DEFAULT_POLICIES 中登记的工具的兜底策略
@@ -58,6 +60,8 @@ _PREVIEW_KEY: dict[str, str] = {
     "list_dir":   "path",
     "note_save":  "content",
     "activate_skill": "name",
+    "knowledge_search": "query",
+    "knowledge_read": "chunk_id",
 }
 _PREVIEW_MAX = 60
 
